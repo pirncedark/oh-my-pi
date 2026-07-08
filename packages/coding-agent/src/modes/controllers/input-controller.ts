@@ -552,12 +552,15 @@ export class InputController {
 		const useWinDictation = () => process.platform === "win32" && !settings.get("stt.enabled");
 		this.ctx.editor.sttHoldEnabled = () => useWinDictation() || settings.get("stt.enabled");
 		this.ctx.editor.onSpaceHoldStart = () => {
-			if (useWinDictation()) toggleWindowsDictation();
-			else void this.ctx.handleSTTToggle();
+			if (!useWinDictation()) void this.ctx.handleSTTToggle();
 		};
 		this.ctx.editor.onSpaceHoldEnd = () => {
-			// Win+H dictation stays open after release (it types into the terminal until dismissed).
-			if (!useWinDictation()) void this.ctx.handleSTTToggle();
+			// Win+H must fire only after the bar is physically released: injecting the Win modifier
+			// while Space is still down forms a stray Win+Space chord (layout switcher), and the
+			// trailing auto-repeat spaces would immediately knock the fresh dictation out of
+			// listening. On release both hazards are gone, so the overlay opens with the mic hot.
+			if (useWinDictation()) toggleWindowsDictation();
+			else void this.ctx.handleSTTToggle();
 		};
 		for (const key of this.ctx.keybindings.getKeys("app.clipboard.copyLine")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.handleCopyCurrentLine());
