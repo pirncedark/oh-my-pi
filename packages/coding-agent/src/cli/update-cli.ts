@@ -189,7 +189,7 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 	return isPathInDirectoryLexical(resolvedFile, dirReal);
 }
 
-type UpdateMethod = "brew" | "mise" | "bun" | "binary";
+type UpdateMethod = "brew" | "mise" | "bun" | "binary" | "source";
 
 interface UpdateMethodResolutionOptions {
 	homebrewPrefix?: string;
@@ -197,7 +197,12 @@ interface UpdateMethodResolutionOptions {
 	miseDataDir?: string;
 }
 
-type UpdateTarget = { method: "brew" } | { method: "mise" } | { method: "bun" } | { method: "binary"; path: string };
+type UpdateTarget =
+	| { method: "brew" }
+	| { method: "mise" }
+	| { method: "bun" }
+	| { method: "binary"; path: string }
+	| { method: "source"; path: string };
 
 function resolveUpdateMethod(
 	ompPath: string,
@@ -209,6 +214,23 @@ function resolveUpdateMethod(
 	if (miseBinDirs.some(dir => isPathInDirectory(ompPath, dir))) return "mise";
 	if (miseDataDir && isPathInDirectory(ompPath, path.join(miseDataDir, "shims"))) return "mise";
 	if (bunBinDir && isPathInDirectory(ompPath, bunBinDir)) return "bun";
+
+	// If the resolved binary is actually a script wrapper in a local checkout or points to one
+	if (
+		ompPath.endsWith(".cmd") ||
+		ompPath.endsWith(".sh") ||
+		!ompPath.endsWith(process.platform === "win32" ? ".exe" : "")
+	) {
+		try {
+			const content = fs.readFileSync(ompPath, "utf-8");
+			if (content.includes("src/cli.ts") || content.includes("src\\cli.ts")) {
+				return "source";
+			}
+		} catch (e) {
+			// ignore
+		}
+	}
+
 	return "binary";
 }
 
@@ -229,7 +251,7 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 
 	if (ompPath) {
 		const method = resolveUpdateMethod(ompPath, bunBinDir, { homebrewPrefix, miseBinDirs, miseDataDir });
-		if (method === "binary") return { method, path: ompPath };
+		if (method === "binary" || method === "source") return { method, path: ompPath };
 		return { method };
 	}
 
@@ -877,6 +899,47 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 	printVerifiedVersion(expectedVersion);
 	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
 }
+async function updateViaSource(wrapperPath: string, expectedVersion: string): Promise<void> {
+	console.log(chalk.yellow(`Detected source-based installation wrapper at ${wrapperPath}`));
+	console.log(chalk.dim("Running from source, checking git status..."));
+
+	// We cannot know exactly where the source checkout is reliably from the wrapper
+	// unless we parse it. But we can just tell the user.
+	let repoDir: string | undefined;
+	try {
+		const content = fs.readFileSync(wrapperPath, "utf-8");
+		const cwdMatch = content.match(/--cwd="([^"]+)"/);
+		if (cwdMatch && cwdMatch[1]) {
+			const cwd = cwdMatch[1];
+			repoDir = path.resolve(cwd, "../..");
+		}
+	} catch (e) {
+		// ignore
+	}
+
+	if (repoDir && fs.existsSync(path.join(repoDir, ".git"))) {
+		console.log(chalk.dim(`Updating git repository at ${repoDir}...`));
+		try {
+			const pullResult = await $`git pull`.cwd(repoDir).quiet();
+			if (pullResult.exitCode !== 0) {
+				throw new Error(`git pull failed: ${pullResult.stderr?.toString() || ""}`);
+			}
+			console.log(chalk.dim("Installing dependencies..."));
+			const installResult = await $`bun install`.cwd(repoDir).quiet();
+			if (installResult.exitCode !== 0) {
+				throw new Error(`bun install failed: ${installResult.stderr?.toString() || ""}`);
+			}
+			console.log(chalk.green(`\n${theme.status.success} Successfully updated source checkout`));
+			return;
+		} catch (e) {
+			console.log(chalk.red(`\nSource update failed: ${e instanceof Error ? e.message : String(e)}`));
+			console.log(chalk.dim("Please update manually with git pull."));
+			return;
+		}
+	}
+
+	console.log(chalk.cyan(`\nPlease navigate to your source repository and run: \n  git pull && bun install`));
+}
 
 /**
  * Run the update command.
@@ -920,6 +983,8 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 			await updateViaMise(release.version, opts.force);
 		} else if (target.method === "bun") {
 			await updateViaBun(release.version);
+		} else if (target.method === "source") {
+			await updateViaSource(target.path, release.version);
 		} else {
 			await updateViaBinaryAt(target.path, release.version);
 		}

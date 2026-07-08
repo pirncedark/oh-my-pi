@@ -10,6 +10,7 @@ import {
 	extractImagePathFromText,
 	extractPastePathsFromText,
 	SPACE_HOLD_MECHANICAL_RUN,
+	SPACE_HOLD_MIN_MS,
 	SPACE_HOLD_RELEASE_MS,
 	SPACE_REPEAT_MAX_GAP_MS,
 } from "./custom-editor";
@@ -231,9 +232,13 @@ describe("CustomEditor space-hold push-to-talk", () => {
 		const { editor, events } = makeEditor();
 		editor.handleInput("h");
 		editor.handleInput("i");
-		// Metronomic auto-repeat: the few pre-burst spaces typed are tracked back out when the hold is
-		// recognized, leaving only the pre-burst text.
+		// Metronomic auto-repeat: a short burst alone is not enough — the hold must also span
+		// SPACE_HOLD_MIN_MS before it is recognized.
 		feedSpaces(editor, SPACE_HOLD_MECHANICAL_RUN + 2, REPEAT_GAP_MS);
+		expect(events).toEqual([]);
+		// Keep the bar held past the minimum duration: the pre-burst spaces typed are tracked back
+		// out when the hold is recognized, leaving only the pre-burst text.
+		feedSpaces(editor, Math.ceil(SPACE_HOLD_MIN_MS / REPEAT_GAP_MS) + 1, REPEAT_GAP_MS);
 		expect(editor.getText()).toBe("hi");
 		expect(events).toEqual(["start"]);
 		// Continued auto-repeat while the bar is held is swallowed: no spam, no re-trigger.

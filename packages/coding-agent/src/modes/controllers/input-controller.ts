@@ -156,6 +156,27 @@ const LEFT_DOUBLE_TAP_MIN_GAP_MS = 40;
 const LEFT_DOUBLE_TAP_MAX_GAP_MS = 500;
 const STREAMING_ESCAPE_CANCEL_WINDOW_MS = 2_000;
 
+/**
+ * Toggle the Windows dictation overlay by synthesizing Win+H via user32
+ * `keybd_event` (SendKeys cannot emit the Win modifier). Fire-and-forget: the
+ * overlay attaches to the focused window (this terminal), so recognized speech
+ * is typed straight into the editor.
+ */
+function toggleWindowsDictation(): void {
+	const ps =
+		"Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern void keybd_event(byte k, byte s, uint f, int e);' -Name K -Namespace W; " +
+		"[W.K]::keybd_event(0x5B,0,0,0); [W.K]::keybd_event(0x48,0,0,0); [W.K]::keybd_event(0x48,0,2,0); [W.K]::keybd_event(0x5B,0,2,0)";
+	try {
+		Bun.spawn(["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps], {
+			stdout: "ignore",
+			stderr: "ignore",
+			stdin: "ignore",
+		});
+	} catch {
+		// PowerShell missing/blocked: silently give up — the hold just does nothing.
+	}
+}
+
 export class InputController {
 	constructor(
 		private ctx: InteractiveModeContext,
@@ -513,12 +534,20 @@ export class InputController {
 		for (const key of this.ctx.keybindings.getKeys("app.stt.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleSTTToggle());
 		}
-		// Hold the space bar to push-to-talk: the editor recognizes the auto-repeat burst, tracks
-		// the spam back out, and toggles STT on hold start / release. Gated on `stt.enabled` so a
-		// disabled STT leaves the space bar typing normally.
-		this.ctx.editor.sttHoldEnabled = () => settings.get("stt.enabled");
-		this.ctx.editor.onSpaceHoldStart = () => void this.ctx.handleSTTToggle();
-		this.ctx.editor.onSpaceHoldEnd = () => void this.ctx.handleSTTToggle();
+		// Hold the space bar (~2 s) to push-to-talk: the editor recognizes the auto-repeat burst,
+		// tracks the spam back out, and toggles STT on hold start / release. Gated on `stt.enabled`
+		// so a disabled STT leaves the space bar typing normally — except on Windows, where a hold
+		// with STT disabled opens the OS dictation overlay (Win+H) instead.
+		const useWinDictation = () => process.platform === "win32" && !settings.get("stt.enabled");
+		this.ctx.editor.sttHoldEnabled = () => useWinDictation() || settings.get("stt.enabled");
+		this.ctx.editor.onSpaceHoldStart = () => {
+			if (useWinDictation()) toggleWindowsDictation();
+			else void this.ctx.handleSTTToggle();
+		};
+		this.ctx.editor.onSpaceHoldEnd = () => {
+			// Win+H dictation stays open after release (it types into the terminal until dismissed).
+			if (!useWinDictation()) void this.ctx.handleSTTToggle();
+		};
 		for (const key of this.ctx.keybindings.getKeys("app.clipboard.copyLine")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.handleCopyCurrentLine());
 		}

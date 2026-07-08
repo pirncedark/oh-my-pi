@@ -94,6 +94,9 @@ export const SPACE_HOLD_MECHANICAL_RUN = 2;
 /** Idle gap (ms) after the last repeated space that counts as the space bar being released, ending
  *  the push-to-talk recording. Must comfortably exceed the OS key-repeat interval. */
 export const SPACE_HOLD_RELEASE_MS = 250;
+/** Minimum total hold duration (ms) — measured from the first space of the run — before a
+ *  mechanical cadence is promoted to a hold. Keeps brief accidental holds typing spaces. */
+export const SPACE_HOLD_MIN_MS = 2000;
 
 /** Whether two consecutive inter-space gaps look machine-driven: both within the auto-repeat band
  *  and steady enough (small absolute or proportional difference). OS key-repeat is metronomic, so
@@ -455,6 +458,8 @@ export class CustomEditor extends Editor {
 	#prevSpaceGap: number | undefined;
 	/** Monotonic timestamp (ms) of the last space, to measure the gap to the next one. */
 	#lastSpaceAt = Number.NEGATIVE_INFINITY;
+	/** Monotonic timestamp (ms) of the first space of the current run — the hold's start. */
+	#spaceRunStartAt = Number.NEGATIVE_INFINITY;
 	/** True while a recognized space-hold push-to-talk recording is in progress. */
 	#spaceHoldActive = false;
 	/** Idle timer that fires `onSpaceHoldEnd` once repeated spaces stop arriving. */
@@ -547,6 +552,7 @@ export class CustomEditor extends Editor {
 		const now = performance.now();
 		const gap = now - this.#lastSpaceAt;
 		const prevGap = this.#prevSpaceGap;
+		if (prevGap === undefined) this.#spaceRunStartAt = now;
 		this.#lastSpaceAt = now;
 		this.#prevSpaceGap = gap;
 		if (prevGap === undefined || !gapsAreMechanical(gap, prevGap)) {
@@ -558,8 +564,9 @@ export class CustomEditor extends Editor {
 			return true;
 		}
 		// Steady fast repeat: swallow it. Once the cadence has held for SPACE_HOLD_MECHANICAL_RUN
-		// deltas it's a held bar — track back the few pre-burst spaces already typed and start.
-		if (++this.#mechanicalRun >= SPACE_HOLD_MECHANICAL_RUN) {
+		// deltas AND the bar has been down for SPACE_HOLD_MIN_MS total, it's a deliberate hold —
+		// track back the few pre-burst spaces already typed and start.
+		if (++this.#mechanicalRun >= SPACE_HOLD_MECHANICAL_RUN && now - this.#spaceRunStartAt >= SPACE_HOLD_MIN_MS) {
 			this.deleteBeforeCursor(this.#spaceRunInserted);
 			this.#resetSpaceRun();
 			this.#beginSpaceHold();
@@ -572,6 +579,7 @@ export class CustomEditor extends Editor {
 		this.#mechanicalRun = 0;
 		this.#prevSpaceGap = undefined;
 		this.#lastSpaceAt = Number.NEGATIVE_INFINITY;
+		this.#spaceRunStartAt = Number.NEGATIVE_INFINITY;
 	}
 
 	#beginSpaceHold(): void {

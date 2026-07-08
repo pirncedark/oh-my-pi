@@ -36,6 +36,13 @@ if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 }
 
 process.title = APP_NAME;
+// Set the terminal tab title immediately at startup (OSC 0). VS Code's
+// integrated terminal otherwise falls back to the spawned process name
+// (e.g. "bun" when launched via `bun run cli.ts`) until title-generator's
+// session-based rename fires, which only happens in extension mode.
+if (process.stdout.isTTY) {
+	process.stdout.write(`\x1b]0;${APP_NAME}\x07`);
+}
 
 // Worker-host entry declaration (Worker threads and worker subprocesses
 // re-enter `Bun.main` with a hidden argv selector instead of loading separate

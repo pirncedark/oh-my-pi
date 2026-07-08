@@ -1110,6 +1110,39 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "update",
+		description: `Check for and install ${APP_NAME} updates`,
+		inlineHint: "[--force] [--check]",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const args = command.args.trim().split(/\s+/).filter(Boolean);
+			const force = args.includes("--force") || args.includes("-f");
+			const check = args.includes("--check") || args.includes("-c");
+			await runtime.output(`Checking for ${APP_NAME} updates…`);
+			const { runUpdateCommand } = await import("../cli/update-cli");
+			try {
+				await runUpdateCommand({ force, check });
+			} catch (err) {
+				await runtime.output(`Update failed: ${err instanceof Error ? err.message : String(err)}`);
+			}
+			return commandConsumed();
+		},
+		handleTui: async (command, runtime) => {
+			runtime.ctx.editor.setText("");
+			const args = command.args.trim().split(/\s+/).filter(Boolean);
+			const force = args.includes("--force") || args.includes("-f");
+			const check = args.includes("--check") || args.includes("-c");
+			runtime.ctx.showStatus(`Checking for ${APP_NAME} updates…`);
+			const { runUpdateCommand } = await import("../cli/update-cli");
+			try {
+				await runUpdateCommand({ force, check });
+				runtime.ctx.showStatus(`${APP_NAME} update finished — restart ${APP_NAME} to use the new version if one was installed.`);
+			} catch (err) {
+				runtime.ctx.showWarning(`Update failed: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		},
+	},
+	{
 		name: "tools",
 		description: "Show tools currently visible to the agent",
 		acpDescription: "Show available tools",
