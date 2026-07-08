@@ -451,7 +451,7 @@ export class WelcomeComponent implements Component {
 	}
 }
 
-export const PI_LOGO = ["▀██████████▀", " ╘██    ██  ", "  ██    ██  ", "  ██    ██  ", " ▄██▄  ▄██▄ "];
+export const PI_LOGO = [" ▄██▄  ▐██▀▀ ██ ▐█▌", "██  ██ ▐██   ██ ▐█▌", "██▀▀██ ▐██▀▀ ██ ▐█▌", "██  ██ ▐██   ██ ▐█▌", "██  ██ ▐██    ▀██▀ "];
 
 /** Multi-stop palette for the diagonal gradient. */
 const GRADIENT_STOPS: ReadonlyArray<readonly [number, number, number]> = [
