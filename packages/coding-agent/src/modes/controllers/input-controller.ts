@@ -156,35 +156,36 @@ const LEFT_DOUBLE_TAP_MIN_GAP_MS = 40;
 const LEFT_DOUBLE_TAP_MAX_GAP_MS = 500;
 const STREAMING_ESCAPE_CANCEL_WINDOW_MS = 2_000;
 
+/** Lazily-opened user32 `keybd_event` binding; `null` after a failed open so we only try once. */
+let keybdEvent: ((key: number, scan: number, flags: number, extra: number) => void) | null | undefined;
+
 /**
  * Toggle the Windows dictation overlay by synthesizing Win+H via user32
- * `keybd_event` (SendKeys cannot emit the Win modifier). Fire-and-forget: the
- * overlay attaches to the focused window (this terminal), so recognized speech
- * is typed straight into the editor.
+ * `keybd_event`, called in-process through `bun:ffi`. No child process is
+ * spawned, so the terminal never loses foreground focus — the overlay attaches
+ * to this window with the mic already listening, and recognized speech is
+ * typed straight into the editor.
  */
 function toggleWindowsDictation(): void {
-	// Capture the foreground window (this terminal) before synthesizing Win+H, then hand focus
-	// back to it once the overlay is up: dictation inserts into the focused control, so the
-	// editor's text box must own focus for speech to land in it with the mic hot.
-	const ps =
-		"Add-Type -MemberDefinition '" +
-		'[DllImport("user32.dll")] public static extern void keybd_event(byte k, byte s, uint f, int e); ' +
-		'[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow(); ' +
-		'[DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr h);' +
-		"' -Name K -Namespace W; " +
-		"$fg=[W.K]::GetForegroundWindow(); " +
-		"[W.K]::keybd_event(0x5B,0,0,0); [W.K]::keybd_event(0x48,0,0,0); [W.K]::keybd_event(0x48,0,2,0); [W.K]::keybd_event(0x5B,0,2,0); " +
-		"Start-Sleep -Milliseconds 600; [void][W.K]::SetForegroundWindow($fg)";
-	try {
-		Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps], {
-			stdout: "ignore",
-			stderr: "ignore",
-			stdin: "ignore",
-			windowsHide: true,
-		});
-	} catch {
-		// PowerShell missing/blocked: silently give up — the hold just does nothing.
+	if (keybdEvent === undefined) {
+		try {
+			const { dlopen } = require("bun:ffi") as typeof import("bun:ffi");
+			const user32 = dlopen("user32.dll", {
+				keybd_event: { args: ["u8", "u8", "u32", "i32"], returns: "void" },
+			});
+			keybdEvent = user32.symbols.keybd_event as NonNullable<typeof keybdEvent>;
+		} catch {
+			keybdEvent = null; // FFI unavailable: the hold just does nothing.
+		}
 	}
+	if (!keybdEvent) return;
+	const VK_LWIN = 0x5b;
+	const VK_H = 0x48;
+	const KEYUP = 0x0002;
+	keybdEvent(VK_LWIN, 0, 0, 0);
+	keybdEvent(VK_H, 0, 0, 0);
+	keybdEvent(VK_H, 0, KEYUP, 0);
+	keybdEvent(VK_LWIN, 0, KEYUP, 0);
 }
 
 export class InputController {
