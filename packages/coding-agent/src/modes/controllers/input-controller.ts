@@ -163,14 +163,24 @@ const STREAMING_ESCAPE_CANCEL_WINDOW_MS = 2_000;
  * is typed straight into the editor.
  */
 function toggleWindowsDictation(): void {
+	// Capture the foreground window (this terminal) before synthesizing Win+H, then hand focus
+	// back to it once the overlay is up: dictation inserts into the focused control, so the
+	// editor's text box must own focus for speech to land in it with the mic hot.
 	const ps =
-		"Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern void keybd_event(byte k, byte s, uint f, int e);' -Name K -Namespace W; " +
-		"[W.K]::keybd_event(0x5B,0,0,0); [W.K]::keybd_event(0x48,0,0,0); [W.K]::keybd_event(0x48,0,2,0); [W.K]::keybd_event(0x5B,0,2,0)";
+		"Add-Type -MemberDefinition '" +
+		'[DllImport("user32.dll")] public static extern void keybd_event(byte k, byte s, uint f, int e); ' +
+		'[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow(); ' +
+		'[DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr h);' +
+		"' -Name K -Namespace W; " +
+		"$fg=[W.K]::GetForegroundWindow(); " +
+		"[W.K]::keybd_event(0x5B,0,0,0); [W.K]::keybd_event(0x48,0,0,0); [W.K]::keybd_event(0x48,0,2,0); [W.K]::keybd_event(0x5B,0,2,0); " +
+		"Start-Sleep -Milliseconds 600; [void][W.K]::SetForegroundWindow($fg)";
 	try {
-		Bun.spawn(["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps], {
+		Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps], {
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",
+			windowsHide: true,
 		});
 	} catch {
 		// PowerShell missing/blocked: silently give up — the hold just does nothing.
