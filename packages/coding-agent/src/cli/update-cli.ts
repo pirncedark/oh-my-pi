@@ -920,7 +920,13 @@ async function updateViaSource(wrapperPath: string, expectedVersion: string): Pr
 	if (repoDir && fs.existsSync(path.join(repoDir, ".git"))) {
 		console.log(chalk.dim(`Updating git repository at ${repoDir}...`));
 		try {
-			const pullResult = await $`git pull`.cwd(repoDir).quiet();
+			// On a fork, new releases live on the `upstream` remote, not `origin`: a plain
+			// `git pull` would only re-fetch the fork branch and never reach the new version.
+			const remotes = (await $`git remote`.cwd(repoDir).quiet()).stdout.toString();
+			const hasUpstream = remotes.split(/\r?\n/).includes("upstream");
+			const pullResult = hasUpstream
+				? await $`git pull --no-edit upstream main`.cwd(repoDir).quiet()
+				: await $`git pull`.cwd(repoDir).quiet();
 			if (pullResult.exitCode !== 0) {
 				throw new Error(`git pull failed: ${pullResult.stderr?.toString() || ""}`);
 			}
