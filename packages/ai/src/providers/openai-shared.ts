@@ -123,7 +123,8 @@ export interface OpenAIRequestSetupModel extends OpenAIModelIdentity {
 	compat?: Pick<ResolvedOpenAISharedCompat, "promptCacheSessionHeader">;
 }
 
-export interface OpenAIResponsesCacheOptions {
+/** Cache identity controls shared by OpenAI-family transports. */
+export interface OpenAICacheOptions {
 	cacheRetention?: CacheRetention;
 	sessionId?: string;
 	promptCacheKey?: string;
@@ -173,6 +174,14 @@ function applyCoreWeaveProjectHeader(headers: Record<string, string>): void {
 	if (projectHeaders) {
 		headers[COREWEAVE_PROJECT_HEADER] = projectHeaders[COREWEAVE_PROJECT_HEADER];
 	}
+}
+
+function setHeaderIfAbsent(headers: Record<string, string>, name: string, value: string): void {
+	const normalizedName = name.toLowerCase();
+	for (const existingName in headers) {
+		if (existingName.toLowerCase() === normalizedName) return;
+	}
+	headers[name] = value;
 }
 
 export function resolveOpenAIRequestSetup(
@@ -257,11 +266,11 @@ export function resolveOpenAIRequestSetup(
 	}
 
 	if (options.openAISessionId && model.provider === "openai") {
-		headers.session_id ??= options.openAISessionId;
-		headers["x-client-request-id"] ??= options.openAISessionId;
+		setHeaderIfAbsent(headers, "session_id", options.openAISessionId);
+		setHeaderIfAbsent(headers, "x-client-request-id", options.openAISessionId);
 	}
 	if (options.promptCacheSessionId && model.compat?.promptCacheSessionHeader) {
-		headers[model.compat.promptCacheSessionHeader] ??= options.promptCacheSessionId;
+		setHeaderIfAbsent(headers, model.compat.promptCacheSessionHeader, options.promptCacheSessionId);
 	}
 
 	if (options.defaultBaseUrl !== undefined) {
@@ -368,7 +377,8 @@ export function calculateOpenAIUsageAccounting(accounting: OpenAIUsageAccounting
 	};
 }
 
-export function normalizeOpenAIResponsesPromptCacheKey(sessionId: string | undefined): string | undefined {
+/** Normalize a cache identity to the wire limit accepted by OpenAI-family providers. */
+export function normalizeOpenAIPromptCacheKey(sessionId: string | undefined): string | undefined {
 	return normalizeOpenAIStableId(sessionId, 64, "pc_");
 }
 
@@ -376,20 +386,21 @@ export function normalizeOpenRouterResponsesSessionId(sessionId: string | undefi
 	return normalizeOpenAIStableId(sessionId, 256, "session_");
 }
 
-export function getOpenAIResponsesPromptCacheKey(options: OpenAIResponsesCacheOptions | undefined): string | undefined {
+/** Resolve a prompt-cache identity, falling back to the provider session unless caching is disabled. */
+export function getOpenAIPromptCacheKey(options: OpenAICacheOptions | undefined): string | undefined {
 	if (resolveCacheRetention(options?.cacheRetention) === "none") return undefined;
-	return normalizeOpenAIResponsesPromptCacheKey(options?.promptCacheKey ?? options?.sessionId);
+	return normalizeOpenAIPromptCacheKey(options?.promptCacheKey ?? options?.sessionId);
 }
 
 export function getOpenAIResponsesRoutingSessionId(
-	options: Pick<OpenAIResponsesCacheOptions, "cacheRetention" | "sessionId"> | undefined,
+	options: Pick<OpenAICacheOptions, "cacheRetention" | "sessionId"> | undefined,
 ): string | undefined {
 	if (resolveCacheRetention(options?.cacheRetention) === "none") return undefined;
-	return normalizeOpenAIResponsesPromptCacheKey(options?.sessionId);
+	return normalizeOpenAIPromptCacheKey(options?.sessionId);
 }
 
 export function getOpenRouterResponsesSessionId(
-	options: Pick<OpenAIResponsesCacheOptions, "cacheRetention" | "sessionId"> | undefined,
+	options: Pick<OpenAICacheOptions, "cacheRetention" | "sessionId"> | undefined,
 ): string | undefined {
 	if (resolveCacheRetention(options?.cacheRetention) === "none") return undefined;
 	return normalizeOpenRouterResponsesSessionId(options?.sessionId);
@@ -695,13 +706,19 @@ export interface OpenAICompatPolicy {
 	};
 }
 
-function mapOpenAIReasoningEffort(
+/**
+ * Map a user-facing effort to the provider wire value: explicit compat
+ * override first, then the model's baked `thinking.effortMap`, else identity.
+ * Shared by the chat-completions/Responses policy resolver and the Codex
+ * request transformer.
+ */
+export function mapOpenAIReasoningEffort(
 	model: Pick<Model, "thinking">,
-	compat: OpenAICompatPolicyCompat,
+	compat: { reasoningEffortMap?: Partial<Record<Effort, string>> } | undefined,
 	effort: string,
 ): string {
 	const level = effort as Effort;
-	return compat.reasoningEffortMap?.[level] ?? model.thinking?.effortMap?.[level] ?? effort;
+	return compat?.reasoningEffortMap?.[level] ?? model.thinking?.effortMap?.[level] ?? effort;
 }
 
 function isImplicitDisableWhenNotRequested(disableMode: OpenAIReasoningDisableMode): boolean {
@@ -1684,6 +1701,14 @@ export function appendReasoningSummaryPart(
 	item.summary.push(part);
 }
 
+/** Chooses the final reasoning text without discarding content already streamed into the block. */
+export function finalizeReasoningThinking(item: ResponseReasoningItem, streamedThinking: string): string {
+	const summaryThinking = item.summary?.map(part => part.text).join("\n\n") ?? "";
+	if (summaryThinking) return summaryThinking;
+	const contentThinking = item.content?.[0]?.type === "reasoning_text" ? (item.content[0].text ?? "") : "";
+	return contentThinking || streamedThinking || "";
+}
+
 export function appendReasoningSummaryTextDelta(
 	item: ResponseReasoningItem,
 	block: ThinkingContent,
@@ -2208,12 +2233,6 @@ export async function processResponsesStream<TApi extends Api>(
 					? lookupOpenItem({ output_index: event.output_index, item_id: item.id ?? item.call_id })
 					: lookupOpenItem({ output_index: event.output_index, item_id: item.id });
 			if (item.type === "reasoning") {
-				const thinking =
-					item.summary?.length > 0
-						? item.summary.map(part => part.text).join("\n\n")
-						: item.content?.[0]?.type === "reasoning_text"
-							? (item.content[0].text ?? "")
-							: "";
 				// Prefer the routed entry; the bare itemId find misroutes when ids are
 				// absent (`undefined === undefined` matches the FIRST thinking block) and
 				// misses entirely when the done-event id drifts from the added-event id.
@@ -2224,12 +2243,12 @@ export async function processResponsesStream<TApi extends Api>(
 								| ThinkingContent
 								| undefined);
 				if (reasoningBlock) {
-					reasoningBlock.thinking = thinking;
+					reasoningBlock.thinking = finalizeReasoningThinking(item, reasoningBlock.thinking);
 					reasoningBlock.thinkingSignature = JSON.stringify(item);
 					stream.push({
 						type: "thinking_end",
 						contentIndex: contentIndexOf(reasoningBlock),
-						content: thinking,
+						content: reasoningBlock.thinking,
 						partial: output,
 					});
 				}

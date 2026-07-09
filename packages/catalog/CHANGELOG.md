@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+## [16.3.15] - 2026-07-09
+
+### Added
+
+- Added support for Grok 4.5 model
+- Added `gpt-5.6` base models and `gpt-5.6-{luna,sol,terra}-pro` variants
+- Added `meta/muse-spark-1.1` model support
+- Added support for thinking modes on `poolside/laguna` models
+- Added generated GPT-5.6 Pro aliases (`gpt-5.6-{luna,sol,terra}-pro`) on the `openai` and `openai-codex` providers: each alias sends the base model id on the wire (`requestModelId`) with the new `reasoningMode: "pro"` marker, and re-derives from the current base rows on every catalog regeneration.
+
+### Changed
+
+- Updated cache read costs for Grok models
+- Reduced max token limit for Grok 4.3 model
+- Enabled prompt cache affinity for Grok models via the x-grok-conv-id header in OpenAI compatible endpoints
+- Enabled prompt cache affinity for Grok models via the x-grok-conv-id header
+- Marked direct xAI Grok Chat Completions models for `x-grok-conv-id` prompt-cache affinity.
+
+## [16.3.14] - 2026-07-09
+
+### Added
+
+- Added support for GPT-5.6 (Luna, Sol, Terra) model variants
+- Enabled expanded five-tier reasoning effort scale (minimal to xhigh) for GPT-5.6 models
+- Added GPT-5.6 (Terra/Luna/Sol) support for the new `max` reasoning tier: on wire-effort APIs (OpenAI Responses, Codex, Azure, openai-compat/OpenRouter models that advertise reasoning) user efforts shift up one notch — `xhigh` sends `max`, `high` sends `xhigh` — mirroring the Claude Fable/Opus 4.7+ five-tier mapping, and the exposed ladder becomes `minimal..xhigh` with `minimal` reaching the native `low` tier. Devin's per-tier GPT-5.6 sibling rows now collapse into `gpt-5-6-{luna,sol,terra}` logical models with the same shifted routing (`xhigh` → `-max`), plus `-fast` families that keep the direct `low..xhigh` `-priority` scale since Devin serves no `-max-priority` tier.
+
+## [16.3.13] - 2026-07-09
+
+### Added
+
+- Added support for Grok 4.5 across multiple providers
+- Added support for GPT-5.6 series models (Luna, Sol, Terra)
+- Added Aion 3.0 and 3.0 Mini models
+- Added Kuaishou KAT-Coder v2.5 models
+- Added Nex-N2-Mini and SWE-1.7 series models
+- Added Hy3 models and free variants
+
+### Changed
+
+- Updated cost and token configurations for various models across providers
+- Renamed several models for consistency (e.g., MiniMax M3, Gemma 4 31B, Qwen variants)
+
 ## [16.3.12] - 2026-07-08
 
 ### Fixed
