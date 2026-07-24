@@ -1136,7 +1136,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			const { runUpdateCommand } = await import("../cli/update-cli");
 			try {
 				await runUpdateCommand({ force, check });
-				runtime.ctx.showStatus(`${APP_NAME} update finished — restart ${APP_NAME} to use the new version if one was installed.`);
+				runtime.ctx.showStatus(
+					`${APP_NAME} update finished — restart ${APP_NAME} to use the new version if one was installed.`,
+				);
 			} catch (err) {
 				runtime.ctx.showWarning(`Update failed: ${err instanceof Error ? err.message : String(err)}`);
 			}

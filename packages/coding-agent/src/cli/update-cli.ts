@@ -226,7 +226,7 @@ function resolveUpdateMethod(
 			if (content.includes("src/cli.ts") || content.includes("src\\cli.ts")) {
 				return "source";
 			}
-		} catch (e) {
+		} catch {
 			// ignore
 		}
 	}
@@ -899,7 +899,7 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 	printVerifiedVersion(expectedVersion);
 	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
 }
-async function updateViaSource(wrapperPath: string, expectedVersion: string): Promise<void> {
+async function updateViaSource(wrapperPath: string, _expectedVersion: string): Promise<void> {
 	console.log(chalk.yellow(`Detected source-based installation wrapper at ${wrapperPath}`));
 	console.log(chalk.dim("Running from source, checking git status..."));
 
@@ -909,11 +909,11 @@ async function updateViaSource(wrapperPath: string, expectedVersion: string): Pr
 	try {
 		const content = fs.readFileSync(wrapperPath, "utf-8");
 		const cwdMatch = content.match(/--cwd="([^"]+)"/);
-		if (cwdMatch && cwdMatch[1]) {
+		if (cwdMatch?.[1]) {
 			const cwd = cwdMatch[1];
 			repoDir = path.resolve(cwd, "../..");
 		}
-	} catch (e) {
+	} catch {
 		// ignore
 	}
 

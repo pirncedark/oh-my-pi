@@ -77,3 +77,10 @@ python/robomp/.env
 
 # Local, machine-specific boot perf baseline (see packages/coding-agent/scripts/bench-guard.ts)
 packages/coding-agent/bench/boot-baseline.json
+
+# afu-cli fork: yanlis cwd'de calisan misnomad/AJAN scriptlerinin coding-agent kokune sizmasini engelle
+/packages/coding-agent/fix_*.py
+/packages/coding-agent/main_site.html
+/packages/coding-agent/main_styles.css
+/packages/coding-agent/sablon.css
+/packages/coding-agent/nul
