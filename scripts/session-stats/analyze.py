@@ -23,6 +23,11 @@ from pathlib import Path
 
 DB_PATH = Path.home() / ".omp" / "stats.db"
 
+# Windows konsolu (cp1254 vb.) unicode/emoji çıktısında patlar; stdout'u utf-8'e zorla.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 # --------------------------------------------------------------------------- #
 # Shared helpers
@@ -104,14 +109,21 @@ per_tool_res AS (
         IFNULL(SUM(r.result_tokens),0) AS res_tok
     FROM ss_tool_results r
     GROUP BY r.tool_name
+),
+all_names AS (
+    SELECT tool_name FROM per_tool
+    UNION
+    SELECT tool_name FROM per_tool_res
 )
 SELECT
-    COALESCE(p.tool_name, q.tool_name) AS tool_name,
+    n.tool_name                        AS tool_name,
     IFNULL(p.calls, 0)                 AS calls,
     IFNULL(q.results, 0)               AS results,
     IFNULL(p.arg_tok, 0)               AS arg_tok,
     IFNULL(q.res_tok, 0)               AS res_tok
-FROM per_tool p FULL OUTER JOIN per_tool_res q USING (tool_name)
+FROM all_names n
+LEFT JOIN per_tool     p USING (tool_name)
+LEFT JOIN per_tool_res q USING (tool_name)
 ORDER BY (IFNULL(p.arg_tok, 0) + IFNULL(q.res_tok, 0)) DESC
 """
 
@@ -187,12 +199,19 @@ def cmd_tools(args: argparse.Namespace) -> int:
           SELECT r.tool_name, COUNT(*) AS results, IFNULL(SUM(r.result_tokens),0) AS res_tok
           FROM ss_tool_results r WHERE 1=1 {sf_clause_r}
           GROUP BY r.tool_name
+        ),
+        all_names AS (
+          SELECT tool_name FROM per_tool
+          UNION
+          SELECT tool_name FROM per_tool_res
         )
         SELECT
-          COALESCE(p.tool_name, q.tool_name) AS tool_name,
+          n.tool_name AS tool_name,
           IFNULL(p.calls,0) AS calls, IFNULL(q.results,0) AS results,
           IFNULL(p.arg_tok,0) AS arg_tok, IFNULL(q.res_tok,0) AS res_tok
-        FROM per_tool p FULL OUTER JOIN per_tool_res q USING (tool_name)
+        FROM all_names n
+        LEFT JOIN per_tool     p USING (tool_name)
+        LEFT JOIN per_tool_res q USING (tool_name)
         ORDER BY (IFNULL(p.arg_tok,0) + IFNULL(q.res_tok,0)) DESC
         """,
         sf_params_c + sf_params_r,

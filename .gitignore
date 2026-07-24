@@ -84,3 +84,4 @@ packages/coding-agent/bench/boot-baseline.json
 /packages/coding-agent/main_styles.css
 /packages/coding-agent/sablon.css
 /packages/coding-agent/nul
+/packages/typescript-edit-benchmark/runs/
