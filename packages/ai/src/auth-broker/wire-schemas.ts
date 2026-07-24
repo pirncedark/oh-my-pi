@@ -32,6 +32,8 @@ export const oauthCredentialSchema = type({
 	"projectId?": "string",
 	"email?": "string",
 	"accountId?": "string",
+	"orgId?": "string",
+	"orgName?": "string",
 });
 
 /** OAuth credential as it appears in broker snapshots — refresh replaced with sentinel. */
@@ -45,12 +47,15 @@ export const remoteOauthCredentialSchema = type({
 	"projectId?": "string",
 	"email?": "string",
 	"accountId?": "string",
+	"orgId?": "string",
+	"orgName?": "string",
 });
 
 export const apiKeyCredentialSchema = type({
 	"+": "reject",
 	type: "'api_key'",
 	key: type("string").atLeastLength(1),
+	"source?": "'login'",
 });
 
 /** Discriminated union accepted on POST /v1/credential (writes). */
@@ -74,6 +79,7 @@ export const credentialBlockSnapshotSchema = type({
 	providerKey: type("string").atLeastLength(1),
 	blockScope: "string",
 	blockedUntilMs: "number",
+	"updatedAtMs?": "number",
 });
 
 export const snapshotEntrySchema = type({
@@ -224,6 +230,77 @@ export const usageResponseSchema = type({
 	reports: arkUsageReportSchema.array(),
 });
 
+const usageHistoryEntrySchema = type({
+	recordedAt: "number",
+	provider: "string",
+	accountKey: "string",
+	"email?": "string",
+	"accountId?": "string",
+	limitId: "string",
+	label: "string",
+	"windowLabel?": "string",
+	"usedFraction?": "number",
+	"status?": "'ok' | 'warning' | 'exhausted' | 'unknown'",
+	"resetsAt?": "number",
+});
+
+/** Broker `/v1/usage/history` response — recorded usage-limit snapshots, oldest first. */
+export const usageHistoryResponseSchema = type({
+	"+": "reject",
+	generatedAt: "number",
+	entries: usageHistoryEntrySchema.array(),
+});
+
+const observedUsageEntrySchema = type({
+	at: "number",
+	provider: "string",
+	model: "string",
+	requests: "number",
+	inputTokens: "number",
+	outputTokens: "number",
+	cacheReadTokens: "number",
+	cacheWriteTokens: "number",
+	costUsd: "number",
+});
+
+/** Broker `POST /v1/usage/observed` request — one client's batched observed usage. */
+export const clientUsageReportRequestSchema = type({
+	"+": "reject",
+	installId: "string",
+	"hostname?": "string",
+	entries: observedUsageEntrySchema.array(),
+});
+
+export const clientUsageReportResponseSchema = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+const clientProviderUsageSchema = type({
+	provider: "string",
+	requests: "number",
+	inputTokens: "number",
+	outputTokens: "number",
+	cacheReadTokens: "number",
+	cacheWriteTokens: "number",
+	costUsd: "number",
+});
+
+const clientUsageClientSummarySchema = type({
+	installId: "string",
+	"hostname?": "string",
+	firstSeen: "number",
+	lastSeen: "number",
+	providers: clientProviderUsageSchema.array(),
+});
+
+/** Broker `GET /v1/usage/clients` response — per-client token burn aggregates. */
+export const clientUsageSummaryResponseSchema = type({
+	"+": "reject",
+	generatedAt: "number",
+	clients: clientUsageClientSummarySchema.array(),
+});
+
 // ─── Refresh ───────────────────────────────────────────────────────────────
 
 export const credentialRefreshResponseSchema = type({
@@ -253,6 +330,11 @@ export const credentialBlockResponseSchema = type({
 });
 
 export const credentialBlocksDeleteResponseSchema = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+export const usageStaleResponseSchema = type({
 	"+": "reject",
 	ok: "boolean",
 });

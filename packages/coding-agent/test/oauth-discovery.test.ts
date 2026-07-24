@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import {
 	analyzeAuthError,
 	discoverOAuthEndpoints,
@@ -139,6 +140,7 @@ describe("path-prefixed auth servers", () => {
 					JSON.stringify({
 						authorization_endpoint: "https://gateway.example.com/my-service/oauth",
 						token_endpoint: "https://gateway.example.com/my-service/token",
+						registration_endpoint: "https://gateway.example.com/my-service/register",
 					}),
 					{ status: 200, headers: { "Content-Type": "application/json" } },
 				);
@@ -154,6 +156,7 @@ describe("path-prefixed auth servers", () => {
 		expect(oauth).toEqual({
 			authorizationUrl: "https://gateway.example.com/my-service/oauth",
 			tokenUrl: "https://gateway.example.com/my-service/token",
+			registrationUrl: "https://gateway.example.com/my-service/register",
 		});
 		expect(calls).toContain("https://gateway.example.com/.well-known/oauth-authorization-server/my-service");
 	});
@@ -509,6 +512,7 @@ describe("RFC 8414 §3.3 issuer validation", () => {
 		expect(oauth).toEqual({
 			authorizationUrl: "https://mcp.atlassian.com/v1/authorize",
 			tokenUrl: "https://cf.mcp.atlassian.com/v1/token",
+			registrationUrl: "https://cf.mcp.atlassian.com/v1/register",
 		});
 		expect(calls[0]).toBe("https://mcp.atlassian.com/.well-known/oauth-authorization-server");
 	});
@@ -556,6 +560,7 @@ describe("RFC 8414 §3.3 issuer validation", () => {
 						issuer: "https://mcp.plane.so/http",
 						authorization_endpoint: "https://mcp.plane.so/http/authorize",
 						token_endpoint: "https://mcp.plane.so/http/token",
+						registration_endpoint: "https://mcp.plane.so/http/register",
 					}),
 					{ status: 200, headers: { "Content-Type": "application/json" } },
 				);
@@ -574,6 +579,7 @@ describe("RFC 8414 §3.3 issuer validation", () => {
 		expect(oauth).toEqual({
 			authorizationUrl: "https://mcp.plane.so/http/authorize",
 			tokenUrl: "https://mcp.plane.so/http/token",
+			registrationUrl: "https://mcp.plane.so/http/register",
 			resource: "https://mcp.plane.so/http/mcp",
 		});
 		// Wrong-issuer origin-root metadata WAS fetched and skipped.
@@ -634,5 +640,34 @@ describe("RFC 8414 §3.3 issuer validation", () => {
 			authorizationUrl: "https://auth.example.com/oauth",
 			tokenUrl: "https://auth.example.com/token",
 		});
+	});
+});
+
+describe("bounded discovery fetches", () => {
+	// A fetch that never resolves on its own; it settles only when its
+	// AbortSignal fires. Pre-fix, discovery passed no signal, so this hung forever.
+	const hangingFetch: FetchImpl = (_input, init) => {
+		const { promise, reject } = Promise.withResolvers<Response>();
+		const signal = init?.signal;
+		const abort = () => reject(new DOMException("aborted", "AbortError"));
+		if (signal?.aborted) abort();
+		else signal?.addEventListener("abort", abort, { once: true });
+		return promise;
+	};
+
+	it("aborts hanging well-known discovery fetches instead of stalling", async () => {
+		const oauth = await discoverOAuthEndpoints("https://mcp.example.test/mcp", undefined, undefined, {
+			fetch: hangingFetch,
+			signal: AbortSignal.timeout(50),
+		});
+		expect(oauth).toBeNull();
+	});
+
+	it("aborts a hanging resource_metadata fetch and returns undefined", async () => {
+		const scopes = await fetchResourceMetadataScopes(
+			"https://mcp.example.test/.well-known/oauth-protected-resource",
+			{ fetch: hangingFetch, signal: AbortSignal.timeout(50) },
+		);
+		expect(scopes).toBeUndefined();
 	});
 });

@@ -1,5 +1,14 @@
 import { renderDemotedThinking } from "../dialect/demotion";
-import type { Api, AssistantMessage, Message, Model, ToolCall, ToolResultMessage, UserMessage } from "../types";
+import type {
+	Api,
+	AssistantMessage,
+	DeveloperMessage,
+	Message,
+	Model,
+	ToolCall,
+	ToolResultMessage,
+	UserMessage,
+} from "../types";
 import { isDemotedThinking, kDemotedThinking } from "../utils/block-symbols";
 
 const enum ToolCallStatus {
@@ -286,6 +295,176 @@ function normalizeAnthropicTargetToolCallId<TApi extends Api>(
  * - Preserves tool call structure (unlike converting to text summaries)
  * - Injects synthetic "aborted" tool results
  */
+const SENSITIVE_TOKEN_RE =
+	/(?<![a-zA-Z0-9_*-])(gh[opusr]_[a-zA-Z0-9_*]{36,}|github_pat_[a-zA-Z0-9_*]{36,}|glpat-[a-zA-Z0-9_*-]{20,}|sk-proj-[a-zA-Z0-9_*-]{36,}|sk-ant-[a-zA-Z0-9_*-]{36,}|sk-[a-zA-Z0-9_*-]{48,})(?![a-zA-Z0-9_*-])/gi;
+
+function hasPlausibleCredentialEntropy(token: string): boolean {
+	const lower = token.toLowerCase();
+	const prefixLength = lower.startsWith("github_pat_")
+		? "github_pat_".length
+		: lower.startsWith("glpat-")
+			? "glpat-".length
+			: lower.startsWith("sk-proj-")
+				? "sk-proj-".length
+				: lower.startsWith("sk-ant-")
+					? "sk-ant-".length
+					: lower.startsWith("gh")
+						? 4
+						: 3;
+	const secret = token.slice(prefixLength);
+	if (/^\*+$/.test(secret)) return true;
+	return [/[a-z]/, /[A-Z]/, /\d/, /[_-]/].filter(pattern => pattern.test(secret)).length >= 2;
+}
+
+/**
+ * Whether outbound credential-pattern redaction is active. Off by default;
+ * hosts opt in explicitly (the coding agent wires this to the
+ * `secrets.enabled` setting).
+ */
+let credentialRedactionEnabled = false;
+
+/**
+ * Toggle outbound credential-pattern redaction. When disabled (the default),
+ * {@link redactSensitiveCredentials} and {@link redactSensitiveInObject} are
+ * pass-throughs and outbound messages/system prompts leave the process
+ * unmodified.
+ */
+export function configureCredentialRedaction(enabled: boolean): void {
+	credentialRedactionEnabled = enabled;
+}
+
+export function redactSensitiveCredentials(text: string): string {
+	if (!credentialRedactionEnabled) return text;
+	return text.replace(SENSITIVE_TOKEN_RE, match => {
+		if (!hasPlausibleCredentialEntropy(match)) return match;
+		const lower = match.toLowerCase();
+		if (lower.startsWith("gh")) {
+			return "[github_token_redacted]";
+		}
+		if (lower.startsWith("gl")) {
+			return "[gitlab_token_redacted]";
+		}
+		if (lower.startsWith("sk-ant-")) {
+			return "[anthropic_token_redacted]";
+		}
+		if (lower.startsWith("sk")) {
+			return "[openai_token_redacted]";
+		}
+		return "[token_redacted]";
+	});
+}
+
+export function redactSensitiveInObject(val: unknown): { result: unknown; changed: boolean } {
+	if (!credentialRedactionEnabled) return { result: val, changed: false };
+	if (typeof val === "string") {
+		const redacted = redactSensitiveCredentials(val);
+		return { result: redacted, changed: redacted !== val };
+	}
+	if (Array.isArray(val)) {
+		let changed = false;
+		const result = val.map(item => {
+			const res = redactSensitiveInObject(item);
+			if (res.changed) changed = true;
+			return res.result;
+		});
+		return { result, changed };
+	}
+	if (val !== null && typeof val === "object") {
+		let changed = false;
+		const res: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(val)) {
+			const sub = redactSensitiveInObject(v);
+			if (sub.changed) changed = true;
+			res[k] = sub.result;
+		}
+		return { result: res, changed };
+	}
+	return { result: val, changed: false };
+}
+
+function redactSensitiveCredentialsInMessages(messages: Message[]): Message[] {
+	if (!credentialRedactionEnabled) return messages;
+	return messages.map((msg): Message => {
+		if (msg.role === "user" || msg.role === "developer") {
+			const userMsg = msg as UserMessage | DeveloperMessage;
+			if (typeof userMsg.content === "string") {
+				const redacted = redactSensitiveCredentials(userMsg.content);
+				if (redacted === userMsg.content) return msg;
+				return { ...userMsg, content: redacted } as Message;
+			}
+			const contentArray = userMsg.content;
+			let changed = false;
+			const content = contentArray.map((block): UserMessage["content"][number] => {
+				if (block.type === "text") {
+					const redacted = redactSensitiveCredentials(block.text);
+					if (redacted !== block.text) {
+						changed = true;
+						return { ...block, text: redacted };
+					}
+				}
+				return block;
+			});
+			return (changed ? { ...userMsg, content } : userMsg) as Message;
+		}
+
+		if (msg.role === "toolResult") {
+			const toolResultMsg = msg as ToolResultMessage;
+			let changed = false;
+			const content = toolResultMsg.content.map((block): ToolResultMessage["content"][number] => {
+				if (block.type === "text") {
+					const redacted = redactSensitiveCredentials(block.text);
+					if (redacted !== block.text) {
+						changed = true;
+						return { ...block, text: redacted };
+					}
+				}
+				return block;
+			});
+			return (changed ? { ...toolResultMsg, content } : toolResultMsg) as Message;
+		}
+
+		if (msg.role === "assistant") {
+			const assistantMsg = msg as AssistantMessage;
+			let changed = false;
+			const content = assistantMsg.content.map((block): AssistantMessage["content"][number] => {
+				if (block.type === "text") {
+					const redacted = redactSensitiveCredentials(block.text);
+					if (redacted !== block.text) {
+						changed = true;
+						return { ...block, text: redacted };
+					}
+				} else if (block.type === "thinking") {
+					const redacted = redactSensitiveCredentials(block.thinking);
+					if (redacted !== block.thinking) {
+						changed = true;
+						return { ...block, thinking: redacted, thinkingSignature: undefined };
+					}
+				} else if (block.type === "toolCall") {
+					if (block.arguments) {
+						const { result: redactedArgs, changed: argsChanged } = redactSensitiveInObject(block.arguments);
+						if (argsChanged) {
+							changed = true;
+							const castArgs =
+								redactedArgs && typeof redactedArgs === "object" && !Array.isArray(redactedArgs)
+									? (redactedArgs as Record<string, unknown>)
+									: undefined;
+							return {
+								...block,
+								arguments: castArgs,
+								thoughtSignature: undefined,
+							} as AssistantMessage["content"][number];
+						}
+					}
+				}
+				return block;
+			});
+			return (changed ? { ...assistantMsg, content } : assistantMsg) as Message;
+		}
+
+		return msg;
+	});
+}
+
 export function transformMessages<TApi extends Api>(
 	messages: Message[],
 	model: Model<TApi>,
@@ -294,6 +473,11 @@ export function transformMessages<TApi extends Api>(
 	duplicateToolCallIdSuffixPrefix = "_dup",
 	targetCompat: Model<TApi>["compat"] = model.compat,
 ): Message[] {
+	// Redact sensitive credential-like patterns from all outbound messages when
+	// the host opted in via `configureCredentialRedaction` — prevents security
+	// block errors from LLM providers (e.g. invalid_prompt).
+	messages = redactSensitiveCredentialsInMessages(messages);
+
 	// Drop assistant `toolCall` blocks with empty/whitespace `id` or `name`
 	// (and their matched `toolResult` messages) before anything else looks at
 	// the history. Replays of these would 400 every provider — see
@@ -439,22 +623,34 @@ export function transformMessages<TApi extends Api>(
 							? { ...block, thinkingSignature: undefined }
 							: block;
 					if (isAnthropicReplay) {
+						// A signature is only replayable where its issuer can verify it.
+						// Same-provider replays (including cross-model-id switches within
+						// official Anthropic — pinned by the prefill suite) keep the
+						// latest turn byte-for-byte per Anthropic's rule for its own most
+						// recent response. A latest turn minted by a DIFFERENT provider
+						// is not "Anthropic's own response": its signature can never
+						// verify on a signing Anthropic target and wedges the session
+						// with `400 Invalid signature in thinking block` on every
+						// attempt until the poisoned turn ages out of the replay window
+						// (observed live: a kimi-code/k3 turn replayed to official
+						// Anthropic after a session-level model switch mid tool-loop).
+						const crossProviderSource = assistantMsg.provider !== model.provider;
 						// Latest abandoned turn: Anthropic's byte-for-byte rule forbids
-						// even stripping a signature on the latest message.
-						if (isLatestSurvivingAssistant && abandonedToolUse) return block;
-						// Cross-model prior turns crossing an official Anthropic endpoint
-						// must strip the source signature so the downstream encoder
-						// applies its `replayUnsignedThinking` policy (unsigned thinking
-						// is emitted natively on Anthropic-compatible reasoning endpoints
-						// and demoted to text on official Anthropic). 3p ↔ 3p replays
-						// keep the signature so the reasoning chain stays signed on
-						// continuation (#2265).
-						if (
-							!isLatestSurvivingAssistant &&
-							!isSameModel &&
-							signingAnthropicInvolved &&
-							sanitized.thinkingSignature
-						) {
+						// even stripping a signature on the latest message — but only
+						// for turns the target's own provider issued.
+						if (isLatestSurvivingAssistant && abandonedToolUse && !crossProviderSource) return block;
+						// Strip source signatures crossing an official Anthropic
+						// endpoint so the downstream encoder applies its
+						// `replayUnsignedThinking` policy (unsigned thinking is emitted
+						// natively on Anthropic-compatible reasoning endpoints and
+						// demoted to text on official Anthropic). Prior turns strip on
+						// any cross-model transition (#4297); the latest turn strips
+						// only on a cross-provider transition so same-provider
+						// continuations stay byte-for-byte. 3p ↔ 3p replays keep the
+						// signature so the reasoning chain stays signed on continuation
+						// (#2265).
+						const staleSignature = isLatestSurvivingAssistant ? crossProviderSource : !isSameModel;
+						if (staleSignature && signingAnthropicInvolved && sanitized.thinkingSignature) {
 							sanitized = { ...sanitized, thinkingSignature: undefined };
 						}
 						// Drop blocks with neither a signature anchor nor any text —
@@ -524,17 +720,33 @@ export function transformMessages<TApi extends Api>(
 
 				if (block.type === "redactedThinking") {
 					// Redacted thinking is native-only. Keep it for same-model
-					// signed replay, the latest byte-for-byte Anthropic turn, or
-					// compatible targets that will also emit sibling unsigned
-					// thinking natively. Drop it when the matching visible thinking
-					// was discarded, or when visible thinking was cross-model
-					// stripped and will be demoted to text.
+					// signed replay, for the latest byte-for-byte turn issued by the
+					// target's own provider, or for compatible targets that will
+					// also emit sibling unsigned thinking natively. Drop it when the
+					// matching visible thinking was discarded, or when visible
+					// thinking was stripped and will be demoted to text — a foreign
+					// redacted payload can no more verify on a signing target than a
+					// foreign visible signature can, even on the latest turn.
 					if (isAnthropicReplay) {
 						if (dropsAllSameModelVisibleThinking) return [];
-						if (isSameModel || isLatestSurvivingAssistant || replaysUnsignedAnthropicThinking) return block;
+						if (
+							isSameModel ||
+							(isLatestSurvivingAssistant && assistantMsg.provider === model.provider) ||
+							replaysUnsignedAnthropicThinking
+						) {
+							return block;
+						}
 						return [];
 					}
 					if (isSameModel) return block;
+					return [];
+				}
+
+				if (block.type === "anthropicServerTool") {
+					// Anthropic requires native server-tool calls and results to be
+					// replayed unchanged. They are meaningful only to the provider
+					// that produced them; every cross-provider target drops them.
+					if (isAnthropicReplay && assistantMsg.provider === model.provider) return block;
 					return [];
 				}
 
@@ -551,6 +763,13 @@ export function transformMessages<TApi extends Api>(
 					// keep it and let `convertAnthropicMessages` re-check the
 					// per-request opt-in before serializing.
 					if (isAnthropicTarget && model.compat.officialEndpoint) return block;
+					return [];
+				}
+
+				if (block.type === "image") {
+					// Assistant images are display artifacts. No provider accepts them
+					// in an assistant replay turn; the native Responses result remains
+					// in providerPayload for OpenAI replay.
 					return [];
 				}
 

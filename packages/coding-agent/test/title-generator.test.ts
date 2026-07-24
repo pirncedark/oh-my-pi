@@ -1,9 +1,15 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { generateSessionTitle } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
-import { logger } from "@oh-my-pi/pi-utils";
+import {
+	disposeTerminalTitleState,
+	generateSessionTitle,
+	setExtensionTerminalTitle,
+	setSessionTerminalTitle,
+	setTerminalTitleState,
+} from "@oh-my-pi/pi-coding-agent/utils/title-generator";
+import { logger, setTerminalHeadless } from "@oh-my-pi/pi-utils";
 
 function getModelOrThrow(id: string): Model<Api> {
 	const model = getBundledModel("anthropic", id);
@@ -68,6 +74,55 @@ describe("title generator", () => {
 		expect(request?.tools).toBeUndefined();
 		expect(options?.toolChoice).toBeUndefined();
 		expect(options?.disableReasoning).toBe(true);
+	});
+
+	it.each([
+		[
+			"<thinking>",
+			"<thinking>Thinking process:\n<title>Wrong internal scratchpad</title>\n</thinking>\n<title>Fix login button</title>",
+		],
+		[
+			"<think>",
+			"<think>Thinking process:\n<title>Wrong internal scratchpad</title>\n</think>\n<title>Fix login button</title>",
+		],
+		[
+			"<reasoning>",
+			"<reasoning>Thinking process:\n<title>Wrong internal scratchpad</title>\n</reasoning>\n<title>Fix login button</title>",
+		],
+		[
+			"```reasoning",
+			"```reasoning\nThinking process:\n<title>Wrong internal scratchpad</title>\n```\n<title>Fix login button</title>",
+		],
+	] as const)("ignores leaked %s reasoning markup before the visible title", async (_marker, responseText) => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: responseText }],
+		} as never);
+
+		const title = await generateSessionTitle(
+			"the login button is broken on mobile",
+			createRegistry(model),
+			createSettings(model),
+		);
+
+		expect(title).toBe("Fix login button");
+	});
+
+	it("preserves in-band reasoning syntax inside the parsed title", async () => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "<title>Fix <think> tag parsing</title>" }],
+		} as never);
+
+		const title = await generateSessionTitle(
+			"fix title generation for <think> tag parsing",
+			createRegistry(model),
+			createSettings(model),
+		);
+
+		expect(title).toBe("Fix <think> tag parsing");
 	});
 
 	it("uses the bundled default prompt when no title prompt file is resolved", async () => {
@@ -188,6 +243,40 @@ describe("title generator", () => {
 		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
 			stopReason: "stop",
 			content: [{ type: "text", text: "<title>none</title>" }],
+		} as never);
+
+		const title = await generateSessionTitle(
+			"I have a quick question for you",
+			createRegistry(model),
+			createSettings(model),
+		);
+
+		expect(title).toBeNull();
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("returns null for a self-closing <title/> marker", async () => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "<title/>" }],
+		} as never);
+
+		const title = await generateSessionTitle(
+			"I have a quick question for you",
+			createRegistry(model),
+			createSettings(model),
+		);
+
+		expect(title).toBeNull();
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("returns null for a bare <title> marker", async () => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "<title>" }],
 		} as never);
 
 		const title = await generateSessionTitle(
@@ -336,6 +425,58 @@ describe("title generator", () => {
 		expect(title).toBe("Fix login button on mobile");
 	});
 
+	it.each(["Here's a thinking process:", "Thinking process:", "Reasoning process:"])(
+		"rejects a markerless prose thinking preamble: %s",
+		async responseText => {
+			const model = getModelFor("deepseek", "deepseek-v4-pro");
+			vi.spyOn(ai, "completeSimple").mockResolvedValue({
+				stopReason: "stop",
+				content: [{ type: "text", text: responseText }],
+			} as never);
+
+			const title = await generateSessionTitle(
+				"the login button is broken on mobile",
+				createRegistry(model),
+				createSettings(model),
+			);
+
+			expect(title).toBeNull();
+		},
+	);
+
+	it("preserves a markerless title that mentions a <think> tag", async () => {
+		const model = getModelFor("deepseek", "deepseek-v4-pro");
+		vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "Fix <think> tag parsing" }],
+		} as never);
+
+		const title = await generateSessionTitle(
+			"fix title generation for <think> tag parsing",
+			createRegistry(model),
+			createSettings(model),
+		);
+
+		expect(title).toBe("Fix <think> tag parsing");
+	});
+
+	it("preserves a markerless title that mentions a ```thinking fence", async () => {
+		const model = getModelFor("deepseek", "deepseek-v4-pro");
+		vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "Fix ```thinking fence parsing" }],
+		} as never);
+
+		const title = await generateSessionTitle(
+			"fix title generation for a ```thinking fence",
+			createRegistry(model),
+			createSettings(model),
+		);
+
+		expect(title).toContain("```thinking");
+		expect(title).toContain("fence");
+	});
+
 	it("strips an unclosed <title> tag from a truncated response", async () => {
 		const model = getModelFor("deepseek", "deepseek-v4-pro");
 		vi.spyOn(ai, "completeSimple").mockResolvedValue({
@@ -433,5 +574,138 @@ describe("title generator", () => {
 		await generateSessionTitle("Some message", registry, currentSettings);
 		expect(mockComplete).toHaveBeenCalled();
 		expect(mockComplete.mock.calls[0]?.[0]).toBe(smolModel);
+	});
+});
+
+// The terminal title runtime is a module-global. `emitTerminalTitle()` composes
+// the emitted OSC title from three inputs — an extension override, a run-state
+// separator (spinner frame / `>` / `!` between the `π` brand and the session
+// label), and the session label — and writes it to
+// `process.stdout` as `ESC]0;<title>BEL`. These tests pin the observable
+// contract at that sink: what STRING actually reaches the terminal after a
+// given sequence of the exported state transitions.
+//
+// Two seams must be opened for the real write to happen under `bun test`:
+//   - `isTerminalHeadless()` defaults to true in the test runtime and short-
+//     circuits `setTerminalTitle` before any write; we opt out with
+//     `setTerminalHeadless(false)` and restore it.
+//   - `setTerminalTitle` also no-ops unless `process.stdout.isTTY`; we force it.
+
+const OSC_TITLE_RE = /\x1b\]0;([\s\S]*?)\x07/;
+
+// Braille spinner frames used by the `working` state (mirrors the module's
+// private TITLE_SPINNER_FRAMES); a clobbered override would surface one of these.
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+describe("terminal title runtime", () => {
+	let writes: string[] = [];
+	let stdoutSpy: { mockRestore(): void } | undefined;
+	let prevHeadless = false;
+	let ttyDescriptor: PropertyDescriptor | undefined;
+
+	// Titles emitted (newest last) since the last reset of `writes`; used across
+	// every assertion, so the OSC extraction lives here rather than at each site.
+	function emittedTitles(): string[] {
+		return writes.map(payload => OSC_TITLE_RE.exec(payload)?.[1]).filter((t): t is string => t !== undefined);
+	}
+
+	beforeEach(() => {
+		// Deterministic clock so the real spinner interval can be advanced without
+		// a wall-clock wait.
+		vi.useFakeTimers();
+
+		// Force the real write path: not headless, stdout is a TTY.
+		prevHeadless = setTerminalHeadless(false);
+		ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+
+		writes = [];
+		stdoutSpy = spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+			writes.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk as Uint8Array));
+			return true;
+		});
+
+		// Drive the module-global back to a known state from the public API so
+		// the tests are order-independent: clear any override + session base and
+		// settle the run state to idle.
+		setSessionTerminalTitle(undefined);
+		setTerminalTitleState("idle");
+
+		// Discard the reset's own emissions; each test asserts only its own writes.
+		writes.length = 0;
+	});
+
+	afterEach(() => {
+		// Stop any spinner timer started during a test before tearing spies down.
+		disposeTerminalTitleState();
+		stdoutSpy?.mockRestore();
+		stdoutSpy = undefined;
+		if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
+		else Reflect.deleteProperty(process.stdout, "isTTY");
+		setTerminalHeadless(prevHeadless);
+		vi.useRealTimers();
+	});
+
+	it("keeps an extension override verbatim across a run-state change (spinner never clobbers it)", () => {
+		// CONTRACT (core regression): once an extension owns the title, flipping
+		// the run state to `working` must NOT re-emit the base title with a
+		// spinner prefix. The override wins verbatim.
+		setExtensionTerminalTitle("Deploying prod");
+		expect(emittedTitles().at(-1)).toBe("Deploying prod");
+
+		writes.length = 0;
+		setTerminalTitleState("working");
+		setTerminalTitleState("attention");
+		setTerminalTitleState("idle");
+
+		// No state transition produced a NEW title away from the override.
+		// (Deduped emits mean the sink may not fire at all; if it does, only "Deploying prod".)
+		for (const title of emittedTitles()) expect(title).toBe("Deploying prod");
+		for (const payload of writes) {
+			for (const frame of SPINNER_FRAMES) expect(payload).not.toContain(frame);
+		}
+	});
+
+	it("keeps the override verbatim across a real spinner tick", () => {
+		// CONTRACT: the periodic spinner tick (frame++ → emit) must also respect
+		// the override. This exercises the timer-driven emission path, not just
+		// the synchronous state setter.
+		setExtensionTerminalTitle("Long extension task");
+		writes.length = 0;
+
+		// Enter `working` to start the spinner interval, then advance the fake
+		// clock across several tick intervals (interval is 80ms).
+		setTerminalTitleState("working");
+		vi.advanceTimersByTime(400);
+
+		for (const title of emittedTitles()) expect(title).toBe("Long extension task");
+		for (const payload of writes) {
+			for (const frame of SPINNER_FRAMES) expect(payload).not.toContain(frame);
+		}
+	});
+
+	it("clears the override when an authoritative session title is set", () => {
+		// CONTRACT: `setSessionTerminalTitle` supersedes any extension override —
+		// the emitted title tracks the real session, not the stale override.
+		setExtensionTerminalTitle("Stale extension title");
+		writes.length = 0;
+
+		setSessionTerminalTitle("my-session");
+
+		const last = emittedTitles().at(-1);
+		expect(last).toBeDefined();
+		expect(last).toContain("my-session");
+		expect(last).not.toContain("Stale extension title");
+	});
+
+	it("dedupes: emitting the same computed title twice writes to the terminal once", () => {
+		// CONTRACT: emission is deduped via `lastEmitted`; a redundant set is a no-op.
+		setSessionTerminalTitle("dup-session");
+		expect(writes.length).toBe(1);
+		expect(emittedTitles().at(-1)).toContain("dup-session");
+
+		setSessionTerminalTitle("dup-session");
+		// Second identical set produced no additional write.
+		expect(writes.length).toBe(1);
 	});
 });

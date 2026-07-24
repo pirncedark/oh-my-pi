@@ -27,6 +27,7 @@ export interface InternalUrlExpansionOptions {
 	noEscape?: boolean;
 	internalRouter?: InternalUrlResolver;
 	localOptions?: LocalProtocolOptions;
+	cwd?: string;
 	ensureLocalParentDirs?: boolean;
 }
 
@@ -66,7 +67,7 @@ export function resolveSkillUrlToPath(url: string, skills: readonly Skill[]): st
 	const hasRelativePath = rawPath !== "" && rawPath !== "/";
 
 	if (!hasRelativePath) {
-		return path.resolve(skill.filePath);
+		return path.resolve(skill.baseDir);
 	}
 
 	let relativePath: string;
@@ -141,9 +142,31 @@ function unquoteToken(token: string): string {
 }
 
 function isInsideShellQuote(command: string, index: number): boolean {
-	let quote: "'" | '"' | undefined;
+	type ShellQuote = "'" | '"' | undefined;
+	interface CommandSubstitution {
+		/** `$(` … `)` tracks paren depth; `` ` `` … `` ` `` is a plain toggle. */
+		kind: "dollar" | "backtick";
+		outerQuote: ShellQuote;
+		depth: number;
+	}
+
+	let quote: ShellQuote;
+	const substitutions: CommandSubstitution[] = [];
 	for (let i = 0; i < index; i++) {
 		const char = command[i];
+		// Inside a backtick substitution nested in double quotes, bash treats `\"`
+		// as a quote delimiter for the inner command, not as an escaped literal.
+		if (
+			char === "\\" &&
+			command[i + 1] === '"' &&
+			quote !== "'" &&
+			substitutions.at(-1)?.kind === "backtick" &&
+			substitutions.at(-1)?.outerQuote === '"'
+		) {
+			quote = quote === '"' ? undefined : '"';
+			i++;
+			continue;
+		}
 		if (char === "\\" && quote !== "'") {
 			i++;
 			continue;
@@ -154,6 +177,36 @@ function isInsideShellQuote(command: string, index: number): boolean {
 		}
 		if (char === '"' && quote !== "'") {
 			quote = quote === '"' ? undefined : '"';
+			continue;
+		}
+		if (char === "$" && command[i + 1] === "(" && quote !== "'") {
+			substitutions.push({ kind: "dollar", outerQuote: quote, depth: 1 });
+			quote = undefined;
+			i++;
+			continue;
+		}
+		if (char === "`" && quote !== "'") {
+			const top = substitutions.at(-1);
+			if (top?.kind === "backtick") {
+				substitutions.pop();
+				quote = top.outerQuote;
+			} else {
+				substitutions.push({ kind: "backtick", outerQuote: quote, depth: 0 });
+				quote = undefined;
+			}
+			continue;
+		}
+		if (quote !== undefined) continue;
+
+		const substitution = substitutions.at(-1);
+		if (substitution?.kind !== "dollar") continue;
+		if (char === "(") {
+			substitution.depth++;
+		} else if (char === ")") {
+			substitution.depth--;
+			if (substitution.depth === 0) {
+				quote = substitutions.pop()?.outerQuote;
+			}
 		}
 	}
 	return quote !== undefined;
@@ -175,6 +228,7 @@ async function resolveInternalUrlToPath(
 	internalRouter?: InternalUrlResolver,
 	localOptions?: LocalProtocolOptions,
 	ensureLocalParentDirs?: boolean,
+	cwd?: string,
 ): Promise<string> {
 	const url = normalizeLocalScheme(rawUrl);
 	const scheme = extractScheme(url);
@@ -208,7 +262,7 @@ async function resolveInternalUrlToPath(
 
 	let resource: InternalResource;
 	try {
-		resource = await internalRouter.resolve(url, { pathOnly: true });
+		resource = await internalRouter.resolve(url, { cwd, pathOnly: true });
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new ToolError(`Failed to resolve ${scheme}:// URL in bash command: ${url}\n${message}`);
@@ -268,6 +322,7 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 				options.internalRouter,
 				options.localOptions,
 				options.ensureLocalParentDirs,
+				options.cwd,
 			);
 		} catch {
 			continue;

@@ -19,28 +19,13 @@ import { EDIT_MODE_STRATEGIES, type EditMode, type PerFileDiffPreview } from "..
 import type { Theme } from "../../modes/theme/theme";
 import { getThemeEpoch, theme } from "../../modes/theme/theme";
 import { BASH_DEFAULT_PREVIEW_LINES } from "../../tools/bash";
+import { formatDefaultToolExecution } from "../../tools/default-renderer";
 import { EVAL_DEFAULT_PREVIEW_LINES } from "../../tools/eval";
-import { isWaitingPollDetails } from "../../tools/job";
-import {
-	formatArgsInline,
-	JSON_TREE_MAX_DEPTH_COLLAPSED,
-	JSON_TREE_MAX_DEPTH_EXPANDED,
-	JSON_TREE_MAX_LINES_COLLAPSED,
-	JSON_TREE_MAX_LINES_EXPANDED,
-	JSON_TREE_SCALAR_LEN_COLLAPSED,
-	JSON_TREE_SCALAR_LEN_EXPANDED,
-	renderJsonTreeLines,
-} from "../../tools/json-tree";
-import {
-	formatExpandHint,
-	formatStatusIcon,
-	replaceTabs,
-	resolveImageOptions,
-	truncateToWidth,
-} from "../../tools/render-utils";
+import { isWaitingPollDetails } from "../../tools/hub";
+import { formatStatusIcon, replaceTabs, resolveImageOptions } from "../../tools/render-utils";
 import { type FirstResultViewportRepaint, toolRenderers } from "../../tools/renderers";
 import { TODO_STRIKE_TOTAL_FRAMES, type TodoToolDetails } from "../../tools/todo";
-import { isFramedBlockComponent, renderStatusLine, WidthAwareText } from "../../tui";
+import { isFramedBlockComponent, markFramedBlockComponent, renderStatusLine, WidthAwareText } from "../../tui";
 import { sanitizeWithOptionalSixelPassthrough } from "../../utils/sixel";
 import { renderDiff } from "./diff";
 
@@ -75,7 +60,7 @@ function stripTrailingUnbalancedRemoval(diff: string | undefined): string | unde
 	return lines.slice(0, lastAddIdx + 1).join("\n");
 }
 
-type DisplaceableToolName = "job" | "todo";
+type DisplaceableToolName = "hub" | "todo";
 
 function isTodoToolDetails(details: unknown): details is TodoToolDetails {
 	return (
@@ -92,7 +77,7 @@ function displaceableToolName(
 	isPartial: boolean,
 ): DisplaceableToolName | undefined {
 	if (result.isError === true) return undefined;
-	if (toolName === "job" && isWaitingPollDetails(result.details)) return "job";
+	if (toolName === "hub" && isWaitingPollDetails(result.details)) return "hub";
 	if (toolName === "todo" && !isPartial && isTodoToolDetails(result.details)) return "todo";
 	return undefined;
 }
@@ -148,6 +133,68 @@ function getArgsWithStreamedTextInput(args: unknown): unknown {
 	return input === undefined ? args : { ...record, input };
 }
 
+type ToolRendererStage = "call" | "result";
+
+class SafeToolRendererComponent implements Component {
+	#toolName: string;
+	#stage: ToolRendererStage;
+	#component: Component;
+	#fallback: () => Component | undefined;
+	#warned = false;
+	readonly wantsKeyRelease: boolean | undefined;
+
+	constructor(
+		toolName: string,
+		stage: ToolRendererStage,
+		component: Component,
+		fallback: () => Component | undefined,
+	) {
+		this.#toolName = toolName;
+		this.#stage = stage;
+		this.#component = component;
+		this.#fallback = fallback;
+		this.wantsKeyRelease = component.wantsKeyRelease;
+		if (isFramedBlockComponent(component)) {
+			markFramedBlockComponent(this);
+		}
+	}
+
+	render(width: number): readonly string[] {
+		try {
+			return this.#component.render(width);
+		} catch (err) {
+			if (!this.#warned) {
+				this.#warned = true;
+				logger.warn("Tool renderer failed", { tool: this.#toolName, stage: this.#stage, error: String(err) });
+			}
+			return this.#fallback()?.render(width) ?? [];
+		}
+	}
+
+	handleInput(data: string): void {
+		const handleInput = this.#component.handleInput;
+		if (handleInput === undefined) return;
+		handleInput.call(this.#component, data);
+	}
+
+	invalidate(): void {
+		const invalidate = this.#component.invalidate;
+		if (invalidate === undefined) return;
+		invalidate.call(this.#component);
+	}
+
+	setIgnoreTight(ignore: boolean): void {
+		const setIgnoreTight = this.#component.setIgnoreTight;
+		if (setIgnoreTight === undefined) return;
+		setIgnoreTight.call(this.#component, ignore);
+	}
+
+	dispose(): void {
+		const dispose = this.#component.dispose;
+		if (dispose === undefined) return;
+		dispose.call(this.#component);
+	}
+}
 /**
  * Transcript-side probe telling a block whether it is still inside the live
  * (repaintable) region. Implemented by `TranscriptContainer`; injected rather
@@ -155,6 +202,14 @@ function getArgsWithStreamedTextInput(args: unknown): unknown {
  */
 export interface TranscriptLiveRegionProbe {
 	isBlockInLiveRegion(component: Component): boolean;
+}
+
+/** Minimal TUI surface ToolExecutionComponent uses to schedule repaints and share image budget. */
+export interface ToolExecutionUi {
+	requestRender(): void;
+	requestComponentRender(component: Component): void;
+	resetDisplay(): void;
+	imageBudget?: TUI["imageBudget"];
 }
 
 export interface ToolExecutionOptions {
@@ -180,6 +235,8 @@ export interface ToolExecutionHandle extends Component {
 	): void;
 	setArgsComplete(toolCallId?: string): void;
 	setExpanded(expanded: boolean): void;
+	/** Freeze the block as final history: stop spinners and let it commit to scrollback. */
+	seal(): void;
 }
 
 /** Redraw live tool blocks at the spinner's glyph-advance rate. Rendering more
@@ -238,7 +295,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	// forcing the common image-free result to re-shape on every resize tick.
 	#renderedImageCount = 0;
 	#tool?: AgentTool;
-	#ui: TUI;
+	#ui: ToolExecutionUi;
 	#cwd: string;
 	#result?: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
@@ -271,7 +328,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	// late result still repaints instead of stranding the streaming preview.
 	#sealed = false;
 	// Tool result snapshots that may be superseded by a later same-tool call
-	// while still in the transcript live region. `job` uses this for repeated
+	// while still in the transcript live region. `hub` uses this for repeated
 	// all-running polls; `todo` uses it for per-turn state snapshots so only the
 	// latest list remains visible.
 	#displaceableByToolName: DisplaceableToolName | undefined;
@@ -306,7 +363,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		args: any,
 		options: ToolExecutionOptions = {},
 		tool: AgentTool | undefined,
-		ui: TUI,
+		ui: ToolExecutionUi,
 		cwd: string = getProjectDir(),
 		_toolCallId?: string,
 	) {
@@ -330,7 +387,21 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		// strips PLAIN-blank edges, so framed/minimal blocks (no bg set) drop these
 		// lines and keep their tight spacing — only tinted lines survive.
 		this.#contentBox = new Box(0, 1);
-		this.#contentText = new WidthAwareText(contentWidth => this.#formatToolExecution(contentWidth), 1, 1);
+		this.#contentText = new WidthAwareText(
+			contentWidth =>
+				formatDefaultToolExecution(
+					{
+						label: this.#toolLabel,
+						args: this.#args,
+						result: this.#result ? { output: this.#getTextOutput(), isError: this.#result.isError } : undefined,
+						options: this.#renderState,
+					},
+					contentWidth,
+					theme,
+				),
+			1,
+			1,
+		);
 
 		// Use Box for custom tools or built-in tools that have renderers
 		const hasRenderer = toolName in toolRenderers;
@@ -608,7 +679,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 			this.#toolName !== "todo" &&
 			!isBackgroundAsyncRunning &&
 			(pendingCallConsumesSpinner || partialResultConsumesSpinner);
-		const needsSpinner = isStreamingArgs || isLivePartialTool || this.#displaceableByToolName === "job";
+		const needsSpinner = isStreamingArgs || isLivePartialTool || this.#displaceableByToolName === "hub";
 		if (needsSpinner && !this.#spinnerInterval) {
 			const frameCount = theme.spinnerFrames.length;
 			const frame = sharedSpinnerFrame(frameCount);
@@ -708,6 +779,20 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	 */
 	getNativeScrollbackLiveRegionStart(): number | undefined {
 		return this.isTranscriptBlockFinalized() ? undefined : 0;
+	}
+
+	/**
+	 * Keeps in-flight TV-wall frames out of immutable native scrollback: the
+	 * `vibe_wait` wall and displaceable snapshots (`hub` waiting polls, `todo`
+	 * lists). Their frames replace each other rather than append, and their
+	 * rows mutate every spinner tick — an unpinned commit records a per-tick
+	 * frozen snapshot AND force-seals the block (see TranscriptContainer's
+	 * committed-snapshot seal), so the next poll stacks a new frame instead of
+	 * displacing this one.
+	 */
+	isNativeScrollbackLiveRegionPinned(): boolean {
+		if (this.isTranscriptBlockFinalized()) return false;
+		return this.#toolName === "vibe_wait" || this.#displaceableByToolName !== undefined;
 	}
 
 	/**
@@ -818,10 +903,9 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 
 	/**
 	 * True while the last painted pending-call shape opted into a full viewport
-	 * repaint at the first result (`forceFirstResultViewportRepaint`) — e.g. the
-	 * streamed SSH placeholder (`⏳ SSH: […]` / `$ …`) or a collapsed write tail
-	 * window, both of which the first result render re-anchors instead of
-	 * preserving. Kept as a per-paint fact so a topology-changing update that
+	 * repaint at the first result (`forceFirstResultViewportRepaint`) — e.g. a
+	 * collapsed write tail window, which the first result render re-anchors
+	 * instead of preserving. Kept as a per-paint fact so a topology-changing update that
 	 * lands before the pending rows reach the terminal skips the reset.
 	 */
 	#needsFirstResultViewportRepaintAtRender(): boolean {
@@ -901,8 +985,17 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 				if (tool.renderCall) {
 					try {
 						const callArgs = this.#getCallArgsForRender();
-						const callComponent = tool.renderCall(callArgs, this.#renderState, theme);
-						if (callComponent) this.#contentBox.addChild(callComponent as Component);
+						const callComponent = tool.renderCall(callArgs, this.#renderState, theme) as Component | undefined;
+						if (callComponent) {
+							this.#contentBox.addChild(
+								new SafeToolRendererComponent(
+									this.#toolName,
+									"call",
+									callComponent,
+									() => new Text(theme.fg("toolTitle", theme.bold(this.#toolLabel)), 0, 0),
+								),
+							);
+						}
 					} catch (err) {
 						logger.warn("Tool renderer failed", { tool: this.#toolName, error: String(err) });
 						// Fall back to default on error
@@ -933,7 +1026,15 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 						theme,
 						this.#args,
 					);
-					if (resultComponent) this.#contentBox.addChild(resultComponent);
+					if (resultComponent) {
+						this.#contentBox.addChild(
+							new SafeToolRendererComponent(this.#toolName, "result", resultComponent, () => {
+								const output = this.#getTextOutput();
+								if (!output) return undefined;
+								return new Text(theme.fg("toolOutput", replaceTabs(output)), 0, 0);
+							}),
+						);
+					}
 				} catch (err) {
 					logger.warn("Tool renderer failed", { tool: this.#toolName, error: String(err) });
 					// Fall back to showing raw output on error
@@ -990,7 +1091,11 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 							this.#renderState,
 							theme,
 						);
-						if (resultComponent) fileBox.addChild(resultComponent);
+						if (resultComponent) {
+							fileBox.addChild(
+								new SafeToolRendererComponent(this.#toolName, "result", resultComponent, () => undefined),
+							);
+						}
 					} catch (err) {
 						logger.warn("Tool renderer failed", { tool: this.#toolName, error: String(err) });
 					}
@@ -1037,7 +1142,16 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 					try {
 						const callArgs = this.#getCallArgsForRender();
 						const callComponent = renderer.renderCall(callArgs, this.#renderState, theme);
-						if (callComponent) this.#contentBox.addChild(callComponent);
+						if (callComponent) {
+							this.#contentBox.addChild(
+								new SafeToolRendererComponent(
+									this.#toolName,
+									"call",
+									callComponent,
+									() => new Text(theme.fg("toolTitle", theme.bold(this.#toolLabel)), 0, 0),
+								),
+							);
+						}
 					} catch (err) {
 						logger.warn("Tool renderer failed", { tool: this.#toolName, error: String(err) });
 						// Fall back to default on error
@@ -1058,7 +1172,15 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 							theme,
 							this.#getCallArgsForRender(),
 						);
-						if (resultComponent) this.#contentBox.addChild(resultComponent);
+						if (resultComponent) {
+							this.#contentBox.addChild(
+								new SafeToolRendererComponent(this.#toolName, "result", resultComponent, () => {
+									const output = this.#getTextOutput();
+									if (!output) return undefined;
+									return new Text(theme.fg("toolOutput", replaceTabs(output)), 0, 0);
+								}),
+							);
+						}
 					} catch (err) {
 						logger.warn("Tool renderer failed", { tool: this.#toolName, error: String(err) });
 						// Fall back to showing raw output on error
@@ -1193,6 +1315,14 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 				if (fallback) context.editStreamingFallback = fallback;
 			}
 			context.renderDiff = renderDiff;
+		} else if (this.#toolName === "write") {
+			// Device-dispatch previews delegate to the mounted tool's own renderer;
+			// expose the session's xd:// registry so custom/MCP renderers survive dispatch.
+			const writeTool = this.#tool as
+				| { session?: { xdevRegistry?: { get(name: string): AgentTool | undefined } } }
+				| undefined;
+			const registry = writeTool?.session?.xdevRegistry;
+			if (registry) context.resolveXdevMounted = (name: string) => registry.get(name);
 		}
 
 		return context;
@@ -1221,97 +1351,5 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		}
 
 		return output;
-	}
-
-	/**
-	 * Format a generic tool execution (fallback for tools without custom renderers)
-	 */
-	#formatToolExecution(contentWidth: number): string {
-		const lines: string[] = [];
-		const icon = this.#isPartial
-			? this.#spinnerFrame !== undefined
-				? "running"
-				: "pending"
-			: this.#result?.isError
-				? "error"
-				: "done";
-		lines.push(renderStatusLine({ icon, spinnerFrame: this.#spinnerFrame, title: this.#toolLabel }, theme));
-
-		const argsObject = this.#args && typeof this.#args === "object" ? (this.#args as Record<string, unknown>) : null;
-		if (!this.#expanded && argsObject && Object.keys(argsObject).length > 0) {
-			// Budget the inline preview against the render width, leaving room for
-			// the ` └─ ` connector prefix instead of a fixed cap.
-			const inlineBudget = Math.max(20, contentWidth - Bun.stringWidth(theme.tree.last) - 2);
-			const preview = formatArgsInline(argsObject, inlineBudget);
-			if (preview) {
-				lines.push(` ${theme.fg("dim", theme.tree.last)} ${theme.fg("dim", preview)}`);
-			}
-		}
-
-		if (this.#expanded && this.#args !== undefined) {
-			lines.push("");
-			lines.push(theme.fg("dim", "Args"));
-			const tree = renderJsonTreeLines(
-				this.#args,
-				theme,
-				JSON_TREE_MAX_DEPTH_EXPANDED,
-				JSON_TREE_MAX_LINES_EXPANDED,
-				JSON_TREE_SCALAR_LEN_EXPANDED,
-			);
-			lines.push(...tree.lines);
-			if (tree.truncated) {
-				lines.push(theme.fg("dim", "…"));
-			}
-			lines.push("");
-		}
-
-		if (!this.#result) {
-			return lines.join("\n");
-		}
-
-		const textContent = this.#getTextOutput().trimEnd();
-		if (!textContent) {
-			lines.push(theme.fg("dim", "(no output)"));
-			return lines.join("\n");
-		}
-
-		if (textContent.startsWith("{") || textContent.startsWith("[")) {
-			try {
-				const parsed = JSON.parse(textContent);
-				const maxDepth = this.#expanded ? JSON_TREE_MAX_DEPTH_EXPANDED : JSON_TREE_MAX_DEPTH_COLLAPSED;
-				const maxLines = this.#expanded ? JSON_TREE_MAX_LINES_EXPANDED : JSON_TREE_MAX_LINES_COLLAPSED;
-				const maxScalarLen = this.#expanded ? JSON_TREE_SCALAR_LEN_EXPANDED : JSON_TREE_SCALAR_LEN_COLLAPSED;
-				const tree = renderJsonTreeLines(parsed, theme, maxDepth, maxLines, maxScalarLen);
-
-				if (tree.lines.length > 0) {
-					lines.push(...tree.lines);
-					if (!this.#expanded) {
-						lines.push(formatExpandHint(theme, this.#expanded, true));
-					} else if (tree.truncated) {
-						lines.push(theme.fg("dim", "…"));
-					}
-					return lines.join("\n");
-				}
-			} catch {
-				// Fall through to raw output
-			}
-		}
-
-		const outputLines = textContent.split("\n");
-		const maxOutputLines = this.#expanded ? 12 : 4;
-		const displayLines = outputLines.slice(0, maxOutputLines);
-
-		for (const line of displayLines) {
-			lines.push(theme.fg("toolOutput", truncateToWidth(replaceTabs(line), contentWidth)));
-		}
-
-		if (outputLines.length > maxOutputLines) {
-			const remaining = outputLines.length - maxOutputLines;
-			lines.push(`${theme.fg("dim", `… ${remaining} more lines`)} ${formatExpandHint(theme, this.#expanded, true)}`);
-		} else if (!this.#expanded) {
-			lines.push(formatExpandHint(theme, this.#expanded, true));
-		}
-
-		return lines.join("\n");
 	}
 }

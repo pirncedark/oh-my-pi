@@ -155,6 +155,31 @@ Cancellation/abort semantics in share:
 - The upload itself is not aborted mid-flight; cancellation is UI-level and
   checked after the upload returns.
 
+## Fresh
+
+Interactive `/fresh` resets the provider-facing stream state of the current
+session **without touching the local transcript, session file, or header**. Use
+it to recover from a wedged or corrupted provider stream (stale prompt cache,
+a mid-turn glitch, or a server-side conversation id that has drifted) while
+keeping the conversation you can see.
+
+`AgentSession.freshSession()`:
+
+- Is rejected while the agent is streaming — wait for the response to finish or
+  abort it first.
+- Closes every cached provider-session state entry (server-side conversation /
+  prompt-cache handles) and reports how many were pruned.
+- Mints a fresh provider session id and re-keys hindsight and mnemopi memory to
+  it, and invalidates the append-only context so the next turn re-sends the full
+  local transcript to the provider.
+- Leaves the local transcript, session file, and session identity unchanged, so
+  nothing you have said or received is lost.
+
+Because it keeps the current session file, `/fresh` differs from `/new` (start a
+brand-new empty session) and `/drop` (delete the current session and start a new
+one): only `/fresh` preserves the visible history while giving the provider a
+clean slate.
+
 ## Fork
 
 Interactive `/fork` creates a new session from the current one and switches the active session identity.
@@ -172,7 +197,7 @@ Interactive `/fork` creates a new session from the current one and switches the 
 2. Flushes pending writes.
 3. Calls `SessionManager.fork()`.
 4. Copies artifacts directory from old session namespace to new namespace (best-effort; non-ENOENT copy failures are logged, not fatal).
-5. Updates `agent.sessionId`.
+5. Updates `agent.sessionId` and inherits the previous provider prompt-cache key unless an explicit prompt-cache key is already pinned.
 6. Emits `session_switch` with `reason: "fork"`.
 
 `SessionManager.fork()` behavior:
@@ -184,6 +209,7 @@ Interactive `/fork` creates a new session from the current one and switches the 
   - new timestamp
   - `cwd` unchanged
   - `parentSession` set to previous session id
+  - `providerPromptCacheKey` set to the previous header's inherited key, or the previous session id when none was pinned
 - Keeps all non-header entries unchanged in the new file.
 
 ### Non-persistent behavior
@@ -200,6 +226,9 @@ Startup `--fork` is resolved before normal session creation:
 2. Path-like values (`/`, `\`, or `.jsonl`) call `SessionManager.forkFrom(path, cwd, sessionDir)`.
 3. Other values resolve via `resolveResumableSession(...)`: local sessions first, then global search when `sessionDir` is not forced. Matching accepts lowercased session id prefixes, full JSONL filename prefixes, and timestamp-stripped filename id suffixes.
 4. The forked file is created in the current cwd/session-dir scope and becomes the active session manager for startup.
+5. Full-context forks automatically seed `providerPromptCacheKey` from the source header's inherited key, falling back to the source session id. Startup drops that automatic inheritance when `--model`, `--thinking`, `--system-prompt`, `--append-system-prompt`, `--tools`, or `--no-tools` changes the provider route or prompt/tool shape.
+
+Use `--prompt-cache-key <key>` to pin the provider prompt-cache identity explicitly and independently from both the OMP session id and `--provider-session-id`. `--provider-session-id` continues to control provider session/routing headers and sticky credential selection; `--prompt-cache-key` controls the OpenAI Responses `prompt_cache_key` payload where supported.
 
 ## Resume and continue
 

@@ -114,6 +114,31 @@ const PROVIDER_META: Record<SearchProviderId, ProviderMeta> = {
 		label: SEARCH_PROVIDER_LABELS.duckduckgo,
 		load: async () => new (await import("./providers/duckduckgo")).DuckDuckGoProvider(),
 	},
+	google: {
+		id: "google",
+		label: SEARCH_PROVIDER_LABELS.google,
+		load: async () => new (await import("./providers/google")).GoogleProvider(),
+	},
+	ecosia: {
+		id: "ecosia",
+		label: SEARCH_PROVIDER_LABELS.ecosia,
+		load: async () => new (await import("./providers/ecosia")).EcosiaProvider(),
+	},
+	startpage: {
+		id: "startpage",
+		label: SEARCH_PROVIDER_LABELS.startpage,
+		load: async () => new (await import("./providers/startpage")).StartpageProvider(),
+	},
+	mojeek: {
+		id: "mojeek",
+		label: SEARCH_PROVIDER_LABELS.mojeek,
+		load: async () => new (await import("./providers/mojeek")).MojeekProvider(),
+	},
+	public: {
+		id: "public",
+		label: SEARCH_PROVIDER_LABELS.public,
+		load: async () => new (await import("./providers/public")).PublicWebProvider(),
+	},
 };
 
 const instanceCache = new Map<SearchProviderId, SearchProvider>();
@@ -164,12 +189,25 @@ export async function getSearchProvider(id: SearchProviderId): Promise<SearchPro
 	return provider;
 }
 
-/** Preferred provider set via settings (default: auto) */
-let preferredProvId: SearchProviderId | "auto" = "auto";
+/** Provider fallback order set via settings (default: built-in order). */
+let orderedProvIds: readonly SearchProviderId[] = SEARCH_PROVIDER_ORDER;
+/** Providers the user explicitly listed in `providers.webSearchOrder`. */
+let explicitProvIds = new Set<SearchProviderId>();
 
-/** Set the preferred web search provider from settings */
-export function setPreferredSearchProvider(provider: SearchProviderId | "auto"): void {
-	preferredProvId = provider;
+/**
+ * Prioritize configured providers while retaining every unlisted provider in
+ * its built-in relative order. Invalid IDs are ignored defensively. Listed
+ * providers are treated as explicit selections: they resolve through
+ * `isExplicitlyAvailable`, so e.g. a hand-listed Perplexity may fall back to
+ * anonymous search exactly like the retired single-preference setting did.
+ */
+export function setSearchProviderOrder(providers: readonly SearchProviderId[]): void {
+	const prioritized = new Set(providers.filter(id => SEARCH_PROVIDER_ORDER.includes(id)));
+	explicitProvIds = prioritized;
+	orderedProvIds =
+		prioritized.size === 0
+			? SEARCH_PROVIDER_ORDER
+			: [...prioritized, ...SEARCH_PROVIDER_ORDER.filter(id => !prioritized.has(id))];
 }
 
 /** Providers excluded from web search resolution via settings. */
@@ -180,34 +218,54 @@ export function setExcludedSearchProviders(providers: readonly SearchProviderId[
 	excludedProvIds = new Set(providers);
 }
 
-function isSearchProviderExcluded(id: SearchProviderId): boolean {
+/** `true` when settings exclude `id` from web search (auto chain and the Public Web fan-out). */
+export function isSearchProviderExcluded(id: SearchProviderId): boolean {
 	return excludedProvIds.has(id);
 }
 
+export interface SearchProviderCandidate {
+	id: SearchProviderId;
+	explicit: boolean;
+}
+
 /**
- * Determine which providers are configured and currently available.
- * Each candidate is loaded (and its `isAvailable()` called) only as the chain
- * is walked, so unconfigured providers never pay the load cost.
+ * Return provider candidates in fallback order without loading their modules.
+ * `forcedProvider` (a per-request `provider` argument) is terminal-first and
+ * bypasses exclusion; configured-order entries carry `explicit: true`.
+ */
+export function resolveProviderCandidates(forcedProvider?: SearchProviderId): SearchProviderCandidate[] {
+	const candidates: SearchProviderCandidate[] = [];
+
+	if (forcedProvider !== undefined && !isSearchProviderExcluded(forcedProvider)) {
+		candidates.push({ id: forcedProvider, explicit: true });
+	}
+
+	for (const id of orderedProvIds) {
+		if (id === forcedProvider || isSearchProviderExcluded(id)) continue;
+		candidates.push({ id, explicit: explicitProvIds.has(id) });
+	}
+
+	return candidates;
+}
+
+/**
+ * Resolve the complete available provider chain.
+ *
+ * This compatibility helper loads every candidate. Search execution should use
+ * {@link resolveProviderCandidates} so fallback modules load only when reached.
  */
 export async function resolveProviderChain(
 	authStorage: AuthStorage,
-	preferredProvider: SearchProviderId | "auto" = preferredProvId,
+	forcedProvider?: SearchProviderId,
 ): Promise<SearchProvider[]> {
 	const providers: SearchProvider[] = [];
 
-	if (preferredProvider !== "auto" && !isSearchProviderExcluded(preferredProvider)) {
-		const provider = await getSearchProvider(preferredProvider);
-		if (await provider.isExplicitlyAvailable(authStorage)) {
-			providers.push(provider);
-		}
-	}
-
-	for (const id of SEARCH_PROVIDER_ORDER) {
-		if (id === preferredProvider || isSearchProviderExcluded(id)) continue;
-		const provider = await getSearchProvider(id);
-		if (await provider.isAvailable(authStorage)) {
-			providers.push(provider);
-		}
+	for (const candidate of resolveProviderCandidates(forcedProvider)) {
+		const provider = await getSearchProvider(candidate.id);
+		const available = candidate.explicit
+			? await provider.isExplicitlyAvailable(authStorage)
+			: await provider.isAvailable(authStorage);
+		if (available) providers.push(provider);
 	}
 
 	return providers;

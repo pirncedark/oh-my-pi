@@ -16,6 +16,9 @@ import { subprocessToolRegistry } from "../task/subprocess-tool-registry";
 import type { ToolSession } from ".";
 import { buildOutputValidator, formatAllValidationIssues } from "./output-schema-validator";
 
+const YIELD_RESULT_FORMAT_HINT =
+	'Submit success as {"result":{"data":<your output>}} or failure as {"result":{"error":"message"}}.';
+
 export interface YieldDetails {
 	/** Successful result payload, or omitted when `useLastTurn` requests last-turn extraction. */
 	data?: unknown;
@@ -198,6 +201,14 @@ function wrapYieldParameters(dataSchema: Record<string, unknown>): Record<string
  */
 const MAX_SCHEMA_RETRIES = 3;
 
+/**
+ * Max consecutive untyped empty-result submissions before the yield tool fails
+ * the child explicitly. Some weak tool callers can acknowledge the required
+ * wrapper in prose while repeatedly sending `{ result: {} }`; without a hard
+ * stop the parent waits forever.
+ */
+const MAX_EMPTY_RESULT_RETRIES = 3;
+
 export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 	readonly name = "yield";
 	readonly approval = "read" as const;
@@ -217,6 +228,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 	#knownSectionLabels: readonly string[] = [];
 	#isKnownSection?: (label: string) => boolean;
 	#schemaValidationFailures = 0;
+	#emptyResultFailures = 0;
 
 	constructor(session: ToolSession) {
 		let validate: ((value: unknown) => JsonSchemaValidationResult) | undefined;
@@ -305,7 +317,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 		const raw = params as Record<string, unknown>;
 		const rawResult = raw.result;
 		if (!rawResult || typeof rawResult !== "object" || Array.isArray(rawResult)) {
-			throw new Error("result must be an object containing either data or error");
+			throw new Error(`result must be an object containing either data or error. ${YIELD_RESULT_FORMAT_HINT}`);
 		}
 		const resultRecord = rawResult as Record<string, unknown>;
 		const errorMessage = typeof resultRecord.error === "string" ? resultRecord.error : undefined;
@@ -322,8 +334,26 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 			throw new Error("result cannot contain both data and error");
 		}
 		if (errorMessage === undefined && data === undefined && yieldType === undefined) {
+			this.#emptyResultFailures++;
+			if (this.#emptyResultFailures > MAX_EMPTY_RESULT_RETRIES) {
+				const attemptCount = this.#emptyResultFailures;
+				this.#emptyResultFailures = 0;
+				const error =
+					`yield result stayed empty after ${attemptCount} consecutive attempt(s); aborting child instead of retrying forever. ` +
+					'Submit success as `{ "result": { "data": <your output> } }` or failure as `{ "result": { "error": "message" } }`.';
+				return {
+					content: [{ type: "text", text: `Task aborted: ${error}` }],
+					details: {
+						data: undefined,
+						status: "aborted",
+						error,
+						type: yieldType,
+					},
+				};
+			}
+			const remaining = MAX_EMPTY_RESULT_RETRIES - this.#emptyResultFailures;
 			throw new Error(
-				'result must contain either `data` or `error`. Use `{result: {data: <your output>}}` for success or `{result: {error: "message"}}` for failure.',
+				`result must contain either \`data\` or \`error\`. Use \`{result: {data: <your output>}}\` for success or \`{result: {error: "message"}}\` for failure. Empty untyped result retries remaining before abort: ${remaining}.`,
 			);
 		}
 
@@ -370,6 +400,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 			}
 		}
 
+		this.#emptyResultFailures = 0;
 		const responseText =
 			status === "aborted"
 				? `Task aborted: ${errorMessage}`

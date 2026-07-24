@@ -20,7 +20,7 @@ import { defaultThemes } from "./defaults";
 import lightThemeJson from "./light.json" with { type: "json" };
 import { resolveMermaidAscii } from "./mermaid-cache";
 
-export { getLanguageFromPath } from "../../utils/lang-from-path";
+export { getLanguageFromPath, isMarkdownPath } from "../../utils/lang-from-path";
 
 // ============================================================================
 // Symbol Presets
@@ -92,6 +92,7 @@ export type SymbolKey =
 	// Icons
 	| "icon.model"
 	| "icon.plan"
+	| "icon.prewalk"
 	| "icon.goal"
 	| "icon.pause"
 	| "icon.loop"
@@ -142,6 +143,7 @@ export type SymbolKey =
 	| "thinking.medium"
 	| "thinking.high"
 	| "thinking.xhigh"
+	| "thinking.max"
 	| "thinking.autoPending"
 	// Checkboxes
 	| "checkbox.checked"
@@ -224,6 +226,7 @@ export type SymbolKey =
 	| "tool.debug"
 	| "tool.mcp"
 	| "tool.job"
+	| "tool.launch"
 	| "tool.task"
 	| "tool.todo"
 	| "tool.memory"
@@ -248,7 +251,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"status.disabled": "⦸",
 	"status.enabled": "●",
 	"status.running": "⟳",
-	"status.shadowed": "◌",
+	"status.shadowed": "○",
 	"status.aborted": "⏹",
 	"status.done": "•",
 	// Navigation
@@ -299,6 +302,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	// Icons
 	"icon.model": "⬢",
 	"icon.plan": "🗺",
+	"icon.prewalk": "🏃",
 	"icon.goal": "🎯",
 	"icon.pause": "⏸",
 	"icon.loop": "↻",
@@ -344,11 +348,12 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	// Compaction divider
 	"icon.camera": "📷",
 	// Thinking levels
-	"thinking.minimal": "◔ min",
-	"thinking.low": "◑ low",
-	"thinking.medium": "◒ med",
-	"thinking.high": "◕ high",
-	"thinking.xhigh": "◉ xhigh",
+	"thinking.minimal": "○ min",
+	"thinking.low": "◔ low",
+	"thinking.medium": "◑ med",
+	"thinking.high": "◒ high",
+	"thinking.xhigh": "◕ xhigh",
+	"thinking.max": "◉ max",
 	"thinking.autoPending": "⟳",
 	// Checkboxes
 	"checkbox.checked": "☑",
@@ -431,6 +436,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"tool.debug": "🐞",
 	"tool.mcp": "🔌",
 	"tool.job": "⚙",
+	"tool.launch": "🚀",
 	"tool.task": "⇶",
 	"tool.todo": "☑",
 	"tool.memory": "🧠",
@@ -462,8 +468,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"status.enabled": "\uf111",
 	// pick:  | alt:   
 	"status.running": "\uf110",
-	// pick: ◐ | alt: ◑ ◒ ◓ ◔
-	"status.shadowed": "◐",
+	// pick:  (nf-fa-circle_o, pairs with status.enabled's nf-fa-circle) | alt: ◐ ◑
+	"status.shadowed": "\uf10c",
 	// pick:  | alt:  
 	"status.aborted": "\uf04d",
 	// pick: • | alt: ● ·
@@ -558,6 +564,7 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.model": "\uec19",
 	// pick:  | alt:  
 	"icon.plan": "\uf2d2",
+	"icon.prewalk": "\uf29d",
 	// pick:  (nf-fa-bullseye) | alt:  (nf-md-target) ◎ ⌖
 	"icon.goal": "\uf140",
 	// pick:  (nf-fa-pause) | alt: ⏸ ||
@@ -607,8 +614,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.throughput": "\uf0e4",
 	// pick:  | alt:  
 	"icon.host": "\uf109",
-	// pick:  | alt:  
-	"icon.session": "\uf550",
+	// pick: 󰁑 (nf-md-arrow_left_bold_hexagon_outline) | alt:  
+	"icon.session": "\u{f0051}",
 	// pick:  | alt: 
 	"icon.package": "\uf487",
 	// pick:  | alt:  
@@ -639,19 +646,15 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.mic": "\uf130",
 	// Compaction divider - fa-camera-retro
 	"icon.camera": "\uf083",
-	// Thinking Levels - emoji labels
-	// pick: 🤨 min | alt:  min  min
-	"thinking.minimal": "\u{F0E7} min",
-	// pick: 🤔 low | alt:  low  low
-	"thinking.low": "\u{F10C} low",
-	// pick: 🤓 med | alt:  med  med
-	"thinking.medium": "\u{F192} med",
-	// pick: 🤯 high | alt:  high  high
-	"thinking.high": "\u{F111} high",
-	// pick: 🧠 xhi | alt:  xhi  xhi
-	"thinking.xhigh": "\u{F06D} xhi",
-	// pick:  (fa-circle-o-notch) | alt: 󰂼 (nf-md-cached) ⟳
-	"thinking.autoPending": "\uf1ce",
+	// Thinking levels — increasing circle slices, with fire reserved for max.
+	"thinking.minimal": "\u{F0A9E} min",
+	"thinking.low": "\u{F0A9F} low",
+	"thinking.medium": "\u{F0AA1} med",
+	"thinking.high": "\u{F0AA3} high",
+	"thinking.xhigh": "\u{F0AA5} xhi",
+	"thinking.max": "\u{F06D} max",
+	// Auto mode uses shuffle until the model resolves its thinking level.
+	"thinking.autoPending": "\u{F074}",
 	// Checkboxes
 	// pick:  | alt:  
 	"checkbox.checked": "\uf14a",
@@ -744,6 +747,7 @@ const NERD_SYMBOLS: SymbolMap = {
 	"tool.debug": "\uEAD8",
 	"tool.mcp": "\uEB2D",
 	"tool.job": "\uEBA2",
+	"tool.launch": "\uF135",
 	"tool.task": "\uf4a0",
 	"tool.todo": "\uEAB3",
 	"tool.memory": "\uEACE",
@@ -818,6 +822,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	// Icons
 	"icon.model": "[M]",
 	"icon.plan": "plan",
+	"icon.prewalk": "prewalk",
 	"icon.goal": "goal",
 	"icon.pause": "||",
 	"icon.loop": "loop",
@@ -868,6 +873,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"thinking.medium": "[med]",
 	"thinking.high": "[high]",
 	"thinking.xhigh": "[xhi]",
+	"thinking.max": "[max]",
 	"thinking.autoPending": "[~]",
 	// Checkboxes
 	"checkbox.checked": "[x]",
@@ -947,6 +953,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"tool.debug": "dbg",
 	"tool.mcp": "<>",
 	"tool.job": "job",
+	"tool.launch": "run",
 	"tool.task": ">>>",
 	"tool.todo": "[x]",
 	"tool.memory": "mem",
@@ -1059,6 +1066,7 @@ const themeColorsSchema = type({
 	thinkingMedium: "string | number",
 	thinkingHigh: "string | number",
 	thinkingXhigh: "string | number",
+	"thinkingMax?": "string | number",
 	bashMode: "string | number",
 	pythonMode: "string | number",
 	statusLineBg: "string | number",
@@ -1163,6 +1171,7 @@ export type ThemeColor =
 	| "thinkingMedium"
 	| "thinkingHigh"
 	| "thinkingXhigh"
+	| "thinkingMax"
 	| "bashMode"
 	| "pythonMode"
 	| "statusLineSep"
@@ -1225,6 +1234,7 @@ const THEME_COLOR_RECORD = {
 	thinkingMedium: true,
 	thinkingHigh: true,
 	thinkingXhigh: true,
+	thinkingMax: true,
 	bashMode: true,
 	pythonMode: true,
 	statusLineSep: true,
@@ -1675,6 +1685,9 @@ export class Theme {
 				return (str: string) => this.fg("thinkingHigh", str);
 			case "xhigh":
 				return (str: string) => this.fg("thinkingXhigh", str);
+			case "max":
+				// thinkingMax is optional; themes without it resolve to the xhigh color.
+				return (str: string) => this.fg(this.#fgColors.thinkingMax ? "thinkingMax" : "thinkingXhigh", str);
 			default:
 				return (str: string) => this.fg("thinkingOff", str);
 		}
@@ -1810,6 +1823,7 @@ export class Theme {
 		return {
 			model: this.#symbols["icon.model"],
 			plan: this.#symbols["icon.plan"],
+			prewalk: this.#symbols["icon.prewalk"],
 			goal: this.#symbols["icon.goal"],
 			pause: this.#symbols["icon.pause"],
 			loop: this.#symbols["icon.loop"],
@@ -1861,6 +1875,7 @@ export class Theme {
 			medium: this.#symbols["thinking.medium"],
 			high: this.#symbols["thinking.high"],
 			xhigh: this.#symbols["thinking.xhigh"],
+			max: this.#symbols["thinking.max"],
 			autoPending: this.#symbols["thinking.autoPending"],
 		};
 	}

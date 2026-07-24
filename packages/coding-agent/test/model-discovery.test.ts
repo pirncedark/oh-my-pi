@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -6,7 +7,9 @@ import { Effort, type FetchImpl, type Model } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import type { OpenAICompat } from "@oh-my-pi/pi-catalog/types";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import type { ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
+import { applyLlamaCppQwenThinking } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -277,6 +280,118 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(refreshCalls).toEqual([]);
 		expect(capture.modelListCalls).toBe(0);
 		expect(authStorage.getOAuthCredential("anthropic")?.access).toBe("sk-ant-oat-expired-anthropic");
+	});
+
+	test("online-if-uncached refreshes expired OAuth for authoritative providers even when the cache is fresh", async () => {
+		// Regression for #5364: openai-codex is authoritative, so its bundled
+		// models are pruned only when the manager is actually constructed — which
+		// needs an authenticated key. With an expired OAuth token peekApiKey
+		// returns undefined; the fresh-cache shortcut must NOT skip the refresh, or
+		// the manager is never added and unsupported bundled ids (gpt-5.4-nano)
+		// remain selectable for the whole cache TTL.
+		const { refreshCalls } = await useAuthStorageWithRefreshTracker();
+		await authStorage.set("openai-codex", {
+			type: "oauth",
+			access: "expired-openai-codex",
+			refresh: "refresh-openai-codex",
+			expires: Date.now() - 60_000,
+		});
+		// Fresh + authoritative, but written against no static fingerprint so the
+		// constructed manager still performs the account-scoped fetch.
+		writeModelCache("openai-codex", Date.now() - 60_000, [], true, "", cacheDbPath);
+		let modelListCalls = 0;
+		const fetchMock: FetchImpl = async (input, init) => {
+			const url = String(input);
+			if (url.startsWith("https://chatgpt.com/backend-api") && url.includes("/models")) {
+				modelListCalls++;
+				expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer fresh-openai-codex");
+				return Response.json({
+					models: [
+						{
+							slug: "gpt-5.6-terra",
+							display_name: "GPT-5.6 Terra",
+							context_window: 372_000,
+							supported_in_api: true,
+							input_modalities: ["text", "image"],
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("openai-codex", "online-if-uncached");
+
+		expect(refreshCalls).toEqual(["openai-codex"]);
+		expect(modelListCalls).toBe(1);
+		expect(registry.find("openai-codex", "gpt-5.6-terra")).toBeDefined();
+		expect(registry.find("openai-codex", "gpt-5.4-nano")).toBeUndefined();
+	});
+
+	test("Codex discovery falls back to a resolved non-OAuth token when no OAuth accounts exist", async () => {
+		authStorage.setRuntimeApiKey("openai-codex", "runtime-openai-codex");
+		let modelListCalls = 0;
+		const fetchMock: FetchImpl = async (input, init) => {
+			const url = String(input);
+			if (url.startsWith("https://chatgpt.com/backend-api") && url.includes("/models")) {
+				modelListCalls++;
+				expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer runtime-openai-codex");
+				return Response.json({
+					models: [
+						{
+							slug: "runtime-codex-model",
+							display_name: "Runtime Codex Model",
+							context_window: 128_000,
+							supported_in_api: true,
+							input_modalities: ["text"],
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("openai-codex", "online");
+
+		expect(modelListCalls).toBe(1);
+		expect(registry.find("openai-codex", "runtime-codex-model")).toBeDefined();
+	});
+
+	test("Codex discovery aborts (keeps bundled models) when any account credential fails to refresh", async () => {
+		// Two configured Codex accounts: the fresh one resolves, the expired one's
+		// refresh throws so getOAuthAccesses reports ok:false. A partial union would
+		// be cached as the authoritative catalog and hide the failed account's
+		// models, so discovery must abort and keep bundled models.
+		authStorage.close();
+		authStorage = await AuthStorage.create(":memory:", {
+			refreshOAuthCredential: async (_provider, _credentialId, credential): Promise<OAuthCredentials> => {
+				if (credential.access.includes("expired")) {
+					throw new Error("simulated transient refresh failure");
+				}
+				return { ...credential, expires: Date.now() + 3_600_000 };
+			},
+		});
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", access: "fresh-codex", refresh: "refresh-fresh", expires: Date.now() + 3_600_000 },
+			{ type: "oauth", access: "expired-codex", refresh: "refresh-expired", expires: Date.now() - 60_000 },
+		]);
+		let modelListCalls = 0;
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url.startsWith("https://chatgpt.com/backend-api") && url.includes("/models")) {
+				modelListCalls++;
+				return Response.json({ models: [] });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("openai-codex", "online");
+
+		expect(modelListCalls).toBe(0);
+		expect(getModelsForProvider(registry, "openai-codex").length).toBeGreaterThan(0);
 	});
 
 	test("configured discovery suppresses built-in special OAuth discovery", async () => {
@@ -700,8 +815,8 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(qwen?.reasoning).toBe(true);
 		expect(qwen?.thinking).toEqual({
 			mode: "effort",
-			efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
-			effortMap: { [Effort.Minimal]: Effort.Low },
+			// Local Ollama's wire effort vocabulary is low/medium/high/max.
+			efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.Max],
 		});
 
 		const llama = registry.find("ollama", "llama3.2:3b");
@@ -964,6 +1079,128 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(llama?.contextWindow).toBe(262144);
 		expect(llama?.maxTokens).toBe(262144);
 		expect(llama?.input).toEqual(["text", "image"]);
+	});
+
+	test("llama.cpp discovery routes Qwen models to chat-completions with the chat-template disable dialect", async () => {
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return new Response(
+					JSON.stringify({
+						data: [{ id: "qwen3-8b" }, { id: "ternary-bonsai-27b-q2_0" }, { id: "llama-3.1-8b" }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return new Response(
+					JSON.stringify({
+						default_generation_settings: { n_ctx: 32768, params: { max_tokens: -1, n_predict: -1 } },
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		type DialectFields = { thinkingFormat?: string; reasoningDisableMode?: string; qwenPreserveThinking?: boolean };
+		for (const id of ["qwen3-8b", "ternary-bonsai-27b-q2_0"]) {
+			const qwen = registry.find("llama.cpp", id);
+			expect(qwen?.reasoning).toBe(true);
+			expect(qwen?.api).toBe("openai-completions");
+			expect(qwen?.baseUrl).toBe("http://127.0.0.1:8080/v1");
+			const compat = qwen?.compat as DialectFields | undefined;
+			expect(compat?.thinkingFormat).toBe("qwen-chat-template");
+			expect(compat?.reasoningDisableMode).toBe("qwen-template-false");
+			expect(compat?.qwenPreserveThinking).toBe(true);
+		}
+
+		const plain = registry.find("llama.cpp", "llama-3.1-8b");
+		expect(plain?.reasoning).toBe(false);
+		expect(plain?.api).toBe("openai-responses");
+		expect(plain?.baseUrl).toBe("http://127.0.0.1:8080");
+		expect((plain?.compat as DialectFields | undefined)?.reasoningDisableMode).not.toBe("qwen-template-false");
+	});
+
+	test("configured llama.cpp Qwen model keeps its /v1 runtime URL despite a native-root baseUrl override", async () => {
+		writeRawModelsJson({
+			"llama.cpp": {
+				baseUrl: "http://127.0.0.1:8080",
+				api: "openai-responses",
+				auth: "none",
+				discovery: { type: "llama.cpp" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:8080/models") {
+				return Response.json({ data: [{ id: "qwen3-8b" }] });
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return Response.json({ default_generation_settings: { n_ctx: 32768 } });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		// The configured provider's native-root baseUrl wins in mergeDiscoveredModel,
+		// so without the outermost re-application the routed completions model would
+		// revert to `http://127.0.0.1:8080` and POST to `/chat/completions`.
+		const qwen = registry.find("llama.cpp", "qwen3-8b");
+		expect(qwen?.api).toBe("openai-completions");
+		expect(qwen?.baseUrl).toBe("http://127.0.0.1:8080/v1");
+	});
+
+	test("applyLlamaCppQwenThinking keeps a pi-native gateway base URL without doubling /v1", () => {
+		const upgraded = applyLlamaCppQwenThinking(
+			buildModel({
+				id: "qwen3-8b",
+				name: "qwen3-8b",
+				api: "openai-responses",
+				provider: "llama.cpp",
+				baseUrl: "http://gw:4000",
+				transport: "pi-native",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 32_768,
+				maxTokens: 4096,
+			}),
+		);
+		// streamPiNative appends `/v1/pi/stream`, so the gateway URL must stay bare
+		// rather than gaining a `/v1` that would double to `.../v1/v1/pi/stream`.
+		expect(upgraded.baseUrl).toBe("http://gw:4000");
+		expect(upgraded.transport).toBe("pi-native");
+		expect(upgraded.reasoning).toBe(true);
+		expect((upgraded.compat as { reasoningDisableMode?: string }).reasoningDisableMode).toBe("qwen-template-false");
+	});
+
+	test("runtime metadata refresh probes native /models for a /v1-routed Qwen model", async () => {
+		const requested: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			requested.push(url);
+			if (url === "http://127.0.0.1:8080/models") {
+				return Response.json({ data: [{ id: "qwen3-8b" }] });
+			}
+			if (url === "http://127.0.0.1:8080/props") {
+				return Response.json({ default_generation_settings: { n_ctx: 32_768 } });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const qwen = registry.find("llama.cpp", "qwen3-8b");
+		expect(qwen?.baseUrl).toBe("http://127.0.0.1:8080/v1");
+
+		await registry.refreshSelectedModelMetadata(qwen!);
+		// The routed model carries a /v1 base URL, but the native metadata probe
+		// (meta/status.args/architecture.input_modalities) must stay on /models.
+		expect(requested).toContain("http://127.0.0.1:8080/models");
+		expect(requested).not.toContain("http://127.0.0.1:8080/v1/models");
 	});
 
 	test("llama.cpp discovery marks per-model architecture image modalities as vision-capable", async () => {
@@ -1962,5 +2199,57 @@ describe("ModelRegistry runtime discovery", () => {
 
 		expect(registry.find("litellm-test", "team-gpt")?.contextWindow).toBe(200_000);
 		expect(registry.find("litellm-test", "deployment-id")).toBeUndefined();
+	});
+
+	test("startup restores a legacy stale-marked Copilot -1m variant via requestModelId", () => {
+		// Regression for #6037/#6284: a synthesized Copilot `-1m` long-context
+		// variant keeps the base model's transport headers via `requestModelId`.
+		// The v10 cache omits headers, and legacy rows written by the old id-only
+		// writer flag the variant unrestorable (its base is a different id). The
+		// startup loader must still recover the headers from the bundled base and
+		// keep the model selectable instead of dropping it.
+		const bundledBase = getBundledModel("github-copilot", "gpt-5.6-sol");
+		if (!bundledBase?.headers) {
+			throw new Error("Expected bundled Copilot base to carry transport headers");
+		}
+		const cachedVariant = buildModel({
+			...(bundledBase as ModelSpec<"openai-responses">),
+			id: "gpt-5.6-sol-1m",
+			name: "GPT-5.6 Sol (1M)",
+			requestModelId: "gpt-5.6-sol",
+			contextWindow: 1_050_000,
+		});
+		// Emulate a legacy write: the variant has no same-id static header source,
+		// so it is flagged unrestorable even though its base carries the headers.
+		writeModelCache("github-copilot", Date.now(), [cachedVariant], true, "", cacheDbPath);
+		const db = new Database(cacheDbPath);
+		db.run("UPDATE model_cache SET header_restore_version = 0 WHERE provider_id = ?", ["github-copilot"]);
+		db.close();
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		const restored = registry.find("github-copilot", "gpt-5.6-sol-1m");
+		expect(restored).toBeDefined();
+		expect(restored?.headers).toEqual(bundledBase.headers);
+	});
+
+	test("startup drops a current Copilot alias whose headers differ from its bundled base", () => {
+		const bundledBase = getBundledModel("github-copilot", "gpt-5.6-sol");
+		if (!bundledBase?.headers) {
+			throw new Error("Expected bundled Copilot base to carry transport headers");
+		}
+		const cachedAlias = buildModel({
+			...(bundledBase as ModelSpec<"openai-responses">),
+			id: "gpt-5.6-sol-custom",
+			name: "GPT-5.6 Sol Custom Route",
+			requestModelId: "gpt-5.6-sol",
+			headers: { "X-Tenant-Route": "tenant-a" },
+		});
+		writeModelCache("github-copilot", Date.now(), [cachedAlias], true, "", cacheDbPath, [bundledBase]);
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		expect(registry.find("github-copilot", cachedAlias.id)).toBeUndefined();
+		expect(registry.find("github-copilot", bundledBase.id)?.headers).toEqual(bundledBase.headers);
 	});
 });

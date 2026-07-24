@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Effort } from "@oh-my-pi/pi-ai";
@@ -16,8 +16,11 @@ import {
 	Settings,
 } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { AUTO_IMAGE_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/tools/image-providers";
+import { SEARCH_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/web/search/types";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
+import * as fileLock from "../src/config/file-lock";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 function context(): Context {
@@ -62,6 +65,7 @@ describe("Settings", () => {
 	};
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		clearCustomApis();
 		__providerInFlightForTesting.setRoot(undefined);
 		AgentStorage.resetInstance();
@@ -422,6 +426,85 @@ describe("Settings", () => {
 			expect(settings.getModelRole("smol")).toBe("anthropic/claude-haiku-4-5");
 		});
 
+		it("preserves concurrent external per-role edits when saving one global role", async () => {
+			await writeSettings({
+				modelRoles: { default: "anthropic/claude-sonnet-4-5", advisor: "moonshot/kimi-k2" },
+			});
+
+			// Process loads its #global snapshot.
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// External edit (another omp instance / manual edit): changes advisor,
+			// adds vision. This process's #global is now stale.
+			await writeSettings({
+				modelRoles: {
+					default: "anthropic/claude-sonnet-4-5",
+					advisor: "moonshot/kimi-k3:max",
+					vision: "anthropic/claude-haiku-4-5",
+				},
+			});
+
+			// This process makes one global-scope role switch and flushes.
+			settings.setModelRole("smol", "anthropic/claude-haiku-4-5");
+			await settings.flush();
+
+			const savedSettings = await readSettings();
+			// The role we changed lands…
+			expect((savedSettings.modelRoles as Record<string, string>).smol).toBe("anthropic/claude-haiku-4-5");
+			// …and the concurrent external per-role edits survive rather than
+			// being clobbered by our stale whole-map snapshot.
+			expect(savedSettings.modelRoles).toEqual({
+				default: "anthropic/claude-sonnet-4-5",
+				advisor: "moonshot/kimi-k3:max",
+				vision: "anthropic/claude-haiku-4-5",
+				smol: "anthropic/claude-haiku-4-5",
+			});
+		});
+
+		it("does not replay a preserved role after the save writes it", async () => {
+			await writeSettings({
+				modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const firstSaveEntered = Promise.withResolvers<void>();
+			const releaseFirstSave = Promise.withResolvers<void>();
+			const firstSaveFinished = Promise.withResolvers<void>();
+			const withFileLock = fileLock.withFileLock;
+			vi.spyOn(fileLock, "withFileLock").mockImplementation(async (filePath, fn, options) => {
+				firstSaveEntered.resolve();
+				const result = await withFileLock(filePath, fn, options);
+				firstSaveFinished.resolve();
+				return result;
+			});
+
+			settings.setModelRole("smol", "anthropic/claude-haiku-4-5");
+			await firstSaveEntered.promise;
+			settings.setModelRole("advisor", "moonshot/kimi-k3:max");
+			releaseFirstSave.resolve();
+			await firstSaveFinished.promise;
+
+			expect((await readSettings()).modelRoles).toEqual({
+				default: "anthropic/claude-sonnet-4-5",
+				smol: "anthropic/claude-haiku-4-5",
+				advisor: "moonshot/kimi-k3:max",
+			});
+
+			await writeSettings({
+				modelRoles: {
+					default: "anthropic/claude-sonnet-4-5",
+					smol: "anthropic/claude-haiku-4-5",
+					advisor: "external/new-advisor",
+				},
+			});
+			await settings.flush();
+
+			expect((await readSettings()).modelRoles).toEqual({
+				default: "anthropic/claude-sonnet-4-5",
+				smol: "anthropic/claude-haiku-4-5",
+				advisor: "external/new-advisor",
+			});
+		});
+
 		it("restores persisted model roles after clearing runtime overrides", async () => {
 			await writeSettings({
 				modelRoles: { default: "anthropic/claude-sonnet-4-5" },
@@ -450,6 +533,31 @@ describe("Settings", () => {
 			settings.clearOverride("modelRoles");
 
 			expect(settings.getModelRole("default")).toBe("anthropic/claude-opus-4-5");
+		});
+		it("clears a role when setModelRole receives undefined", () => {
+			const settings = Settings.isolated();
+
+			settings.setModelRole("smol", "x/y");
+			expect(settings.getModelRole("smol")).toBe("x/y");
+
+			settings.setModelRole("smol", undefined);
+
+			expect(settings.getModelRole("smol")).toBeUndefined();
+			expect(Object.hasOwn(settings.getModelRoles(), "smol")).toBe(false);
+		});
+
+		it("clears a role from the runtime override layer so the effective view updates immediately", () => {
+			const settings = Settings.isolated({
+				modelRoles: { smol: "anthropic/claude-haiku-4-5" },
+			});
+
+			settings.overrideModelRoles({ smol: "openai/gpt-5.2-codex" });
+			expect(settings.getModelRole("smol")).toBe("openai/gpt-5.2-codex");
+
+			settings.setModelRole("smol", undefined);
+
+			expect(settings.getModelRole("smol")).toBeUndefined();
+			expect(Object.hasOwn(settings.getModelRoles(), "smol")).toBe(false);
 		});
 	});
 
@@ -489,6 +597,46 @@ describe("Settings", () => {
 
 			expect(settings.getEditVariantForModel("openrouter/moonshotai/Kimi-K2-Instruct")).toBeNull();
 			expect(settings.getEditVariantForModel("openai/gpt-5.2-codex")).toBe("apply_patch");
+		});
+	});
+
+	describe("provider preference migration", () => {
+		it("expands a legacy providers.webSearch choice into the head of webSearchOrder", async () => {
+			await writeSettings({ providers: { webSearch: "exa" } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("providers.webSearchOrder")).toEqual([
+				"exa",
+				...SEARCH_PROVIDER_ORDER.filter(id => id !== "exa"),
+			]);
+		});
+
+		it("drops legacy providers.webSearch auto without seeding an order", async () => {
+			await writeSettings({ providers: { webSearch: "auto" } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("providers.webSearchOrder")).toEqual([]);
+		});
+
+		it("keeps an explicit webSearchOrder over the legacy webSearch preference", async () => {
+			await writeSettings({ providers: { webSearch: "exa", webSearchOrder: ["gemini"] } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("providers.webSearchOrder")).toEqual(["gemini"]);
+		});
+
+		it("expands a legacy providers.image choice into the head of imageOrder", async () => {
+			await writeSettings({ providers: { image: "xai" } });
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("providers.imageOrder")).toEqual([
+				"xai",
+				...AUTO_IMAGE_PROVIDER_ORDER.filter(id => id !== "xai"),
+			]);
 		});
 	});
 
@@ -669,15 +817,114 @@ describe("Settings", () => {
 			expect(settings.get("grep.enabled")).toBe(true);
 		});
 
-		it("migrates legacy tool names in persisted essential overrides", async () => {
+		it("migrates nested dev.autoqa.consent and todo.reminders.max without configuring parents", async () => {
 			await writeSettings({
-				tools: { essentialOverride: ["read", "find", "search", "grep"] },
-				"tools.essentialOverride": ["find", "search", "read"],
+				dev: { autoqa: { consent: "granted" } },
+				todo: { reminders: { max: 5 } },
 			});
 
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 
-			expect(settings.get("tools.essentialOverride")).toEqual(["read", "glob", "grep"]);
+			expect(settings.get("dev.autoqaConsent")).toBe("granted");
+			expect(settings.get("dev.autoqa")).toBe(true);
+			expect(settings.isConfigured("dev.autoqa")).toBe(false);
+			expect(settings.get("todo.remindersMax")).toBe(5);
+			expect(settings.get("todo.reminders")).toBe(true);
+			expect(settings.isConfigured("todo.reminders")).toBe(false);
+		});
+
+		it("migrates quoted dotted legacy keys for consent and reminders max", async () => {
+			await Bun.write(getConfigPath(), `"dev.autoqa.consent": denied\n"todo.reminders.max": 2\n`);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("dev.autoqaConsent")).toBe("denied");
+			expect(settings.isConfigured("dev.autoqa")).toBe(false);
+			expect(settings.get("todo.remindersMax")).toBe(2);
+			expect(settings.get("todo.reminders")).toBe(true);
+		});
+
+		it("lets explicit new keys win over legacy nested consent/max values", async () => {
+			await writeSettings({
+				dev: { autoqa: { consent: "denied" }, autoqaConsent: "granted" },
+				todo: { reminders: { max: 1 }, remindersMax: 9 },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("dev.autoqaConsent")).toBe("granted");
+			expect(settings.isConfigured("dev.autoqa")).toBe(false);
+			expect(settings.get("todo.remindersMax")).toBe(9);
+			expect(settings.get("todo.reminders")).toBe(true);
+		});
+
+		it("preserves recoverable parent booleans alongside legacy leaf keys", async () => {
+			await Bun.write(
+				getConfigPath(),
+				`dev:\n  autoqa: true\n"dev.autoqa.consent": unset\ntodo:\n  reminders: false\n"todo.reminders.max": 4\n`,
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("dev.autoqa")).toBe(true);
+			expect(settings.get("dev.autoqaConsent")).toBe("unset");
+			expect(settings.get("todo.reminders")).toBe(false);
+			expect(settings.get("todo.remindersMax")).toBe(4);
+		});
+
+		it("migrates denied/granted/unset consent values through isolated overrides", () => {
+			for (const consent of ["denied", "granted", "unset"] as const) {
+				const settings = Settings.isolated({
+					"dev.autoqa.consent": consent,
+				} as Partial<Record<SettingPath, unknown>>);
+				expect(settings.get("dev.autoqaConsent")).toBe(consent);
+				expect(settings.isConfigured("dev.autoqa")).toBe(false);
+			}
+		});
+
+		it("persists migrated consent/max keys and drops legacy nested parents on save", async () => {
+			await writeSettings({
+				dev: { autoqa: { consent: "denied" } },
+				todo: { reminders: { max: 1 } },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("dev.autoqaConsent")).toBe("denied");
+			expect(settings.get("todo.remindersMax")).toBe(1);
+
+			// Touch an unrelated key so the migrated tree is written back.
+			settings.set("display.showTokenUsage", true);
+			await settings.flush();
+
+			const onDisk = await readSettings();
+			const dev = onDisk.dev as Record<string, unknown>;
+			const todo = onDisk.todo as Record<string, unknown>;
+			expect(dev.autoqaConsent).toBe("denied");
+			expect(dev.autoqa).toBeUndefined();
+			expect(todo.remindersMax).toBe(1);
+			expect(todo.reminders).toBeUndefined();
+			expect(onDisk["dev.autoqa.consent"]).toBeUndefined();
+			expect(onDisk["todo.reminders.max"]).toBeUndefined();
+
+			const reloaded = await Settings.loadIsolated({ cwd: projectDir, agentDir });
+			expect(reloaded.get("dev.autoqaConsent")).toBe("denied");
+			expect(reloaded.isConfigured("dev.autoqa")).toBe(false);
+			expect(reloaded.get("todo.remindersMax")).toBe(1);
+			expect(reloaded.get("todo.reminders")).toBe(true);
+		});
+
+		it("drops dead BM25-discovery keys and leaves tools.xdev at its default", async () => {
+			await writeSettings({
+				tools: { discoveryMode: "off", essentialOverride: ["read"] },
+				mcp: { discoveryMode: "auto", discoveryDefaultServers: ["gh"] },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// No migration mapping: legacy discovery intent is discarded, xdev
+			// keeps its own default. An explicit xdev value is untouched.
+			expect(settings.get("tools.xdev")).toBe(true);
+			expect(settings.isConfigured("tools.xdev")).toBe(false);
 		});
 
 		it("migrates from settings.json containing comments", async () => {

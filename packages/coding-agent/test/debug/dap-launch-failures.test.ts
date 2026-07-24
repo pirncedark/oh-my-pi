@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as dapModule from "@oh-my-pi/pi-coding-agent/dap";
-import { DapClient } from "@oh-my-pi/pi-coding-agent/dap/client";
+import { connectSocket, DapClient, waitForTcpServerListening } from "@oh-my-pi/pi-coding-agent/dap/client";
 import { DapSessionManager } from "@oh-my-pi/pi-coding-agent/dap/session";
 import type {
 	DapCapabilities,
@@ -487,9 +487,146 @@ describe("DAP launch failure handling", () => {
 	});
 });
 
+describe("connectSocket unix transport", () => {
+	it("rejects instead of hanging when the unix socket cannot be connected", async () => {
+		// A path that stat would report as a socket but that no one listens on
+		// yields ECONNREFUSED/ENOENT from Bun.connect. Before the fix the error
+		// handler only errored the stream and the returned promise never settled,
+		// so `await connectSocket(...)` hung the launch forever.
+		const deadSocket = path.join(
+			os.tmpdir(),
+			`omp-dap-dead-${Date.now()}-${Math.random().toString(36).slice(2)}.sock`,
+		);
+		const start = Date.now();
+		await expect(connectSocket({ unix: deadSocket }, 5_000)).rejects.toThrow();
+		// Must settle on the connect error, not linger until the timeout bound.
+		expect(Date.now() - start).toBeLessThan(2_000);
+	});
+});
+
+describe("DAP TCP transport resilience", () => {
+	const TCP_ADAPTER_BASE: DapResolvedAdapter = {
+		...TEST_ADAPTER,
+		name: "js-debug-adapter",
+		command: process.execPath,
+		resolvedCommand: process.execPath,
+		connectMode: "tcp",
+	};
+
+	// Adapter that binds the reserved port, accepts the first connection, then
+	// drops it after 30ms without answering — the WSL2-mirrored ghost socket.
+	const GHOST_ADAPTER = `
+const port = Number(process.argv[2]);
+const server = Bun.listen({ hostname: "127.0.0.1", port, socket: {
+	open(s){ setTimeout(() => { try { s.end(); } catch {} }, 30); },
+	data(){}, close(){}, error(){},
+}});
+console.log("Debug server listening at 127.0.0.1:" + port);
+await Bun.sleep(60_000);
+`;
+
+	async function withTcpAdapter(
+		source: string,
+		run: (adapter: DapResolvedAdapter, cwd: string) => Promise<void>,
+	): Promise<void> {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-tcp-"));
+		const adapterPath = path.join(cwd, "tcp-adapter.mjs");
+		await fs.writeFile(adapterPath, source);
+		const adapter: DapResolvedAdapter = {
+			...TCP_ADAPTER_BASE,
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: literal DAP `${port}` placeholder substituted by the adapter launcher
+			args: [adapterPath, "${port}", "127.0.0.1"],
+		};
+		try {
+			await run(adapter, cwd);
+		} finally {
+			await removeWithRetries(cwd);
+		}
+	}
+
+	it("rejects a pending request fast when the transport closes cleanly without answering", async () => {
+		await withTcpAdapter(GHOST_ADAPTER, async (adapter, cwd) => {
+			const client = await DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 5_000 });
+			try {
+				// The ghost socket ends the read stream cleanly. The reader must wake
+				// the pending request with a connection-closed error; a wake regression
+				// rejects with `DAP request initialize timed out` instead.
+				await expect(client.sendRequest("initialize", {}, undefined, 60_000)).rejects.toThrow(
+					/DAP connection closed/,
+				);
+			} finally {
+				await client.dispose();
+			}
+		});
+	}, 20_000);
+
+	it("wakes an event waiter when the transport closes instead of waiting out its timeout", async () => {
+		await withTcpAdapter(GHOST_ADAPTER, async (adapter, cwd) => {
+			const client = await DapClient.spawn({ adapter, cwd, socketReadyTimeoutMs: 5_000 });
+			try {
+				// A close must wake the event waiter with the connection error rather
+				// than letting it wait out its own timeout.
+				await expect(client.waitForEvent("stopped", undefined, undefined, 60_000)).rejects.toThrow(
+					/DAP connection closed/,
+				);
+			} finally {
+				await client.dispose();
+			}
+		});
+	}, 20_000);
+
+	// Deterministic gate contract: the client must not open its first connect
+	// until the adapter's stdout mentions the reserved port. Driven with a
+	// synthetic stdout stream — no subprocess, no wall-clock dependence.
+	describe("waitForTcpServerListening", () => {
+		function fakeStdout() {
+			let controller!: ReadableStreamDefaultController<Uint8Array>;
+			const stdout = new ReadableStream<Uint8Array>({
+				start(c) {
+					controller = c;
+				},
+			});
+			const encoder = new TextEncoder();
+			return {
+				proc: { stdout, exitCode: null },
+				push: (text: string) => controller.enqueue(encoder.encode(text)),
+				end: () => controller.close(),
+			};
+		}
+
+		it("holds the gate until stdout announces the port, even split across chunks", async () => {
+			const { proc, push, end } = fakeStdout();
+			let open = false;
+			const gate = waitForTcpServerListening(proc, 43210, 60_000).then(() => {
+				open = true;
+			});
+			push("Starting inspector...\n");
+			push("Debug server listening at 127.0.0.1:43");
+			// Single event-loop turn so the gate's reader consumes the queued
+			// chunks — a scheduling flush, not a tuned wall-clock delay.
+			await Bun.sleep(0);
+			expect(open).toBe(false);
+			push("210\n");
+			await gate;
+			end();
+		});
+
+		it("opens the gate when stdout ends without a banner so the connect loop surfaces the real failure", async () => {
+			const { proc, push, end } = fakeStdout();
+			const gate = waitForTcpServerListening(proc, 43210, 60_000);
+			push("adapter crashed before binding\n");
+			end();
+			await gate;
+		});
+	});
+});
+
 describe("DebugTool launch validation", () => {
 	it("rejects directory programs when the selected adapter cannot debug a directory", async () => {
-		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue(TEST_ADAPTER);
+		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue({
+			kind: "adapter",
+			adapter: TEST_ADAPTER,
+		});
 		try {
 			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-program-"));
 			try {
@@ -523,7 +660,10 @@ describe("DebugTool launch validation", () => {
 			launchDefaults: { request: "launch", mode: "debug", stopOnEntry: true },
 			acceptsDirectoryProgram: true,
 		};
-		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue(dlvAdapter);
+		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue({
+			kind: "adapter",
+			adapter: dlvAdapter,
+		});
 		const sessionLaunchSpy = spyOn(dapModule.dapSessionManager, "launch").mockImplementation(async opts => {
 			throw Object.assign(new Error("captured launch"), { capturedOptions: opts });
 		});
@@ -603,7 +743,10 @@ describe("DebugTool launch validation", () => {
 			launchDefaults: { request: "launch", mode: "debug", stopOnEntry: true },
 			acceptsDirectoryProgram: true,
 		};
-		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue(dlvAdapter);
+		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue({
+			kind: "adapter",
+			adapter: dlvAdapter,
+		});
 		const sessionLaunchSpy = spyOn(dapModule.dapSessionManager, "launch").mockImplementation(async opts => {
 			throw Object.assign(new Error("captured launch"), { capturedOptions: opts });
 		});
@@ -635,7 +778,11 @@ describe("DebugTool launch validation", () => {
 	});
 
 	it("throws targeted 'python not found in PATH' when adapter:'debugpy' is unresolvable for launch", async () => {
-		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue(null);
+		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue({
+			kind: "unavailable",
+			adapterName: "debugpy",
+			command: "python",
+		});
 		try {
 			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-debugpy-"));
 			try {
@@ -685,8 +832,93 @@ describe("DebugTool launch validation", () => {
 		}
 	});
 
+	it("shows the Delve install command when the canonical dlv adapter is unavailable", async () => {
+		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue({
+			kind: "unavailable",
+			adapterName: "dlv",
+			command: "dlv",
+		});
+		try {
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-dlv-hint-"));
+			try {
+				await fs.writeFile(path.join(cwd, "main.go"), "package main\n\nfunc main() {}\n");
+				const session: ToolSession = {
+					cwd,
+					hasUI: false,
+					getSessionFile: () => null,
+					getSessionSpawns: () => "*",
+					settings: Settings.isolated({ "debug.enabled": true }),
+				};
+				const tool = new DebugTool(session);
+
+				await expect(tool.execute("call", { action: "launch", program: "main.go" })).rejects.toThrow(
+					/go install github\.com\/go-delve\/delve\/cmd\/dlv@latest/,
+				);
+			} finally {
+				await removeWithRetries(cwd);
+			}
+		} finally {
+			launchSpy.mockRestore();
+		}
+	});
+
+	it("points to DAP configuration when a custom adapter command is unavailable", async () => {
+		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue({
+			kind: "unavailable",
+			adapterName: "dlv",
+			command: "./bin/missing-dlv",
+		});
+		try {
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-dlv-config-"));
+			try {
+				await fs.writeFile(path.join(cwd, "main.go"), "package main\n\nfunc main() {}\n");
+				const session: ToolSession = {
+					cwd,
+					hasUI: false,
+					getSessionFile: () => null,
+					getSessionSpawns: () => "*",
+					settings: Settings.isolated({ "debug.enabled": true }),
+				};
+				const tool = new DebugTool(session);
+
+				await expect(tool.execute("call", { action: "launch", program: "main.go" })).rejects.toThrow(
+					/configured command '\.\/bin\/missing-dlv' did not resolve.*DAP adapter config/,
+				);
+			} finally {
+				await removeWithRetries(cwd);
+			}
+		} finally {
+			launchSpy.mockRestore();
+		}
+	});
+
+	it("shows the rdbg install command for explicit Ruby attach", async () => {
+		const attachSpy = spyOn(dapModule, "selectAttachAdapter").mockReturnValue(null);
+		try {
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-rdbg-attach-"));
+			try {
+				const session: ToolSession = {
+					cwd,
+					hasUI: false,
+					getSessionFile: () => null,
+					getSessionSpawns: () => "*",
+					settings: Settings.isolated({ "debug.enabled": true }),
+				};
+				const tool = new DebugTool(session);
+
+				await expect(tool.execute("call", { action: "attach", pid: 1234, adapter: "rdbg" })).rejects.toThrow(
+					/gem install debug/,
+				);
+			} finally {
+				await removeWithRetries(cwd);
+			}
+		} finally {
+			attachSpy.mockRestore();
+		}
+	});
+
 	it("falls back to the generic 'No debugger adapter' error when adapter is unspecified", async () => {
-		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue(null);
+		const launchSpy = spyOn(dapModule, "selectLaunchAdapter").mockReturnValue({ kind: "none" });
 		try {
 			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "omp-debug-noadapter-"));
 			try {

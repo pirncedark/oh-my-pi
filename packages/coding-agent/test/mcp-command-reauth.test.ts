@@ -59,6 +59,7 @@ function createController(authStorage: AuthStorage, mcpManagerOverrides: Record<
 	const controller = new MCPCommandController({
 		chatContainer: { addChild: vi.fn() },
 		present,
+		presentCommandOutput: present,
 		ui: { requestRender: vi.fn() },
 		editor,
 		showError,
@@ -175,6 +176,178 @@ describe("/mcp auth commands", () => {
 		const savedUrl = savedServer?.type === "http" || savedServer?.type === "sse" ? savedServer.url : undefined;
 		expect(savedUrl).toBe(RAW_SERVER_URL);
 		expect(savedServer?.auth).toBeUndefined();
+	});
+
+	test("uses the registration endpoint discovered from a pathful issuer", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		const resourceMetadataUrl = "https://gateway.example.com/.well-known/oauth-protected-resource/my-service/mcp";
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(
+			new Error(`HTTP 401: WWW-Authenticate: Bearer resource_metadata="${resourceMetadataUrl}"`),
+		);
+		const registrationRequests: string[] = [];
+		const fetchMock = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit | BunFetchRequestInit): Promise<Response> => {
+				const url = String(input);
+				if (url === resourceMetadataUrl) {
+					return new Response(
+						JSON.stringify({
+							resource: "https://gateway.example.com/my-service/mcp",
+							authorization_servers: ["https://auth.example.com/auth/v1"],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "https://auth.example.com/.well-known/oauth-authorization-server/auth/v1") {
+					return new Response(
+						JSON.stringify({
+							issuer: "https://auth.example.com/auth/v1",
+							authorization_endpoint: "https://auth.example.com/auth/v1/oauth/authorize",
+							token_endpoint: "https://auth.example.com/auth/v1/oauth/token",
+							registration_endpoint: "https://auth.example.com/auth/v1/oauth/register",
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "https://auth.example.com/auth/v1/oauth/register" && init?.method === "POST") {
+					registrationRequests.push(url);
+					return new Response(JSON.stringify({ client_id: "pathful-dcr-client" }), {
+						status: 201,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response("not found", { status: 404 });
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockImplementation(async function (
+			this: oauthFlow.MCPOAuthFlow,
+		) {
+			const { url } = await this.generateAuthUrl("state", "http://127.0.0.1:53192/callback");
+			expect(new URL(url).searchParams.get("client_id")).toBe("pathful-dcr-client");
+			return {
+				access: "fresh-access",
+				refresh: "fresh-refresh",
+				expires: Date.now() + 3_600_000,
+			};
+		});
+		const { controller, showError } = createController(authStorage);
+
+		await controller.handle("/mcp reauth envserver");
+
+		expect(showError).not.toHaveBeenCalled();
+		expect(registrationRequests).toEqual(["https://auth.example.com/auth/v1/oauth/register"]);
+		expect(authStorage.get(oauthFlow.mcpOAuthCredentialId(EXPANDED_SERVER_URL))).toMatchObject({
+			type: "oauth",
+			clientId: "pathful-dcr-client",
+		});
+	});
+
+	test("uses tool challenge resource metadata and scopes during reauth", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		vi.spyOn(mcpClient, "connectToServer").mockRejectedValue(new Error("HTTP 401: Unauthorized"));
+
+		const resourceMetadataUrl = "https://gateway.example.com/.well-known/oauth-protected-resource";
+		const fetchMock = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				const url = String(input);
+				if (url === resourceMetadataUrl) {
+					return new Response(
+						JSON.stringify({
+							resource: "https://gateway.example.com/mcp",
+							authorization_servers: ["https://auth.example.com"],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "https://auth.example.com/.well-known/oauth-authorization-server") {
+					return new Response(
+						JSON.stringify({
+							authorization_endpoint: "https://auth.example.com/authorize",
+							token_endpoint: "https://auth.example.com/token",
+							client_id: "challenge-client",
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response("not found", { status: 404 });
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+		let authorizationUrl = "";
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockImplementation(async function (
+			this: oauthFlow.MCPOAuthFlow,
+		) {
+			authorizationUrl = (await this.generateAuthUrl("state", "http://127.0.0.1:53192/callback")).url;
+			return {
+				access: "fresh-access",
+				refresh: "fresh-refresh",
+				expires: Date.now() + 3_600_000,
+			};
+		});
+
+		const { controller, showError } = createController(authStorage);
+		const updated = await controller.handleMCPAuthChallenge("envserver", {
+			wwwAuthenticate: [`Bearer resource_metadata="${resourceMetadataUrl}" scope="orders.read"`],
+		});
+		expect(updated).toEqual(expect.objectContaining({ type: "http", url: RAW_SERVER_URL }));
+		expect(showError).not.toHaveBeenCalled();
+		expect(new URL(authorizationUrl).searchParams.get("scope")).toBe("orders.read");
+		expect(new URL(authorizationUrl).searchParams.get("resource")).toBe("https://gateway.example.com/mcp");
+	});
+
+	test("reauthorizes on a tool challenge even when the anonymous handshake succeeds", async () => {
+		const authStorage = freshAuthStorage();
+		await authStorage.reload();
+		// Server allows the unauthenticated handshake; only tool calls are protected.
+		vi.spyOn(mcpClient, "connectToServer").mockResolvedValue({} as never);
+		vi.spyOn(mcpClient, "disconnectServer").mockResolvedValue(undefined as never);
+
+		const resourceMetadataUrl = "https://gateway.example.com/.well-known/oauth-protected-resource";
+		const fetchMock = Object.assign(
+			async (input: string | URL | Request): Promise<Response> => {
+				const url = String(input);
+				if (url === resourceMetadataUrl) {
+					return new Response(
+						JSON.stringify({
+							resource: "https://gateway.example.com/mcp",
+							authorization_servers: ["https://auth.example.com"],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				if (url === "https://auth.example.com/.well-known/oauth-authorization-server") {
+					return new Response(
+						JSON.stringify({
+							authorization_endpoint: "https://auth.example.com/authorize",
+							token_endpoint: "https://auth.example.com/token",
+							client_id: "challenge-client",
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response("not found", { status: 404 });
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+
+		vi.spyOn(oauthFlow.MCPOAuthFlow.prototype, "login").mockResolvedValue({
+			access: "fresh-access",
+			refresh: "fresh-refresh",
+			expires: Date.now() + 3_600_000,
+		});
+
+		const { controller, showError } = createController(authStorage);
+		const updated = await controller.handleMCPAuthChallenge("envserver", {
+			wwwAuthenticate: [`Bearer resource_metadata="${resourceMetadataUrl}" scope="orders.read"`],
+		});
+		expect(updated).toEqual(expect.objectContaining({ type: "http", url: RAW_SERVER_URL }));
+		expect(showError).not.toHaveBeenCalled();
 	});
 
 	test("reuses embedded DCR client secret during reauth token exchange", async () => {

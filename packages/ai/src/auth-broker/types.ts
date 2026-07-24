@@ -12,7 +12,7 @@ import type {
 	AuthCredentialSnapshotEntry,
 	StoredCredentialBlock,
 } from "../auth-storage";
-import type { UsageReport } from "../usage";
+import type { ClientUsageClientSummary, ClientUsageReport, UsageHistoryEntry, UsageReport } from "../usage";
 
 /** GET /v1/healthz response body. */
 export interface HealthzResponse {
@@ -47,6 +47,30 @@ export interface UsageResponse {
 	reports: UsageReport[];
 }
 
+/**
+ * GET /v1/usage/history response body. Entries come from the broker host's
+ * durable `usage_history` — the broker performs every upstream usage fetch in
+ * broker deployments, so this is the only complete utilization record.
+ */
+export interface UsageHistoryResponse {
+	generatedAt: number;
+	entries: UsageHistoryEntry[];
+}
+
+/** POST /v1/usage/observed request body — one client's batched observed usage. */
+export type ClientUsageReportRequest = ClientUsageReport;
+
+/** POST /v1/usage/observed response body. */
+export interface ClientUsageReportResponse {
+	ok: boolean;
+}
+
+/** GET /v1/usage/clients response body — per-client token burn aggregates. */
+export interface ClientUsageSummaryResponse {
+	generatedAt: number;
+	clients: ClientUsageClientSummary[];
+}
+
 /** POST /v1/credential/:id/refresh response body. */
 export interface CredentialRefreshResponse {
 	entry: AuthCredentialSnapshotEntry;
@@ -72,6 +96,11 @@ export interface CredentialBlockResponse {
 
 /** DELETE /v1/credential/:id/blocks response body. */
 export interface CredentialBlocksDeleteResponse {
+	ok: boolean;
+}
+
+/** POST /v1/usage/stale response body. */
+export interface UsageStaleResponse {
 	ok: boolean;
 }
 

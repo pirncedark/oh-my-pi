@@ -121,8 +121,11 @@ Core methods:
 - `getCommands`
 - `getSessionName`, `setSessionName`
 - `setModel`, `getThinkingLevel`, `setThinkingLevel`
+- `getServiceTiers`, `setServiceTier`
 - `registerProvider`
 - `events` (shared event bus)
+
+`getServiceTiers()` returns a detached snapshot of the session's live per-family tier map. `setServiceTier(family, tier)` changes one family for subsequent requests; pass `undefined` to clear that session override. OpenAI accepts `auto`, `default`, `flex`, `scale`, or `priority`; Anthropic accepts `priority`; Google accepts `flex` or `priority`. Changes made while a response is streaming do not alter that in-flight request.
 
 In interactive mode, `input` handlers run before the built-in first-message auto-title check. Extensions that call `await pi.setSessionName(...)` from `input` can set the persisted session name and prevent the default auto-generated title from running for that session.
 
@@ -160,6 +163,30 @@ Handlers and tool `execute` receive `ctx` with:
 - `shutdown()`
 - `getSystemPrompt()`
 - `memory` (optional structured memory runtime — status/search/save across the configured backend)
+- `setInterval(fn, ms, ...args)` / `setTimeout(fn, ms, ...args)` / `clearTimer(timer)` — managed timers (see below)
+
+### Background work (`ctx.setInterval` / `ctx.setTimeout`)
+
+Extensions run **in-process with no isolation**. A raw `setInterval`/`setTimeout`/detached-promise callback that throws runs outside the handler-dispatch try/catch, surfaces as a process-level `uncaughtException`, and the global postmortem handler treats it as fatal — **the whole session is torn down**, not just the offending extension.
+
+Use `ctx.setInterval` / `ctx.setTimeout` for any periodic or deferred background work. They mirror the platform signatures but:
+
+- run the callback with the same isolation as handler dispatch — a synchronous throw or a rejected promise is logged and reported through the extension error channel, and the session keeps running;
+- return a handle you can pass to `ctx.clearTimer(handle)`;
+- are `unref`'d (never keep the process alive on their own) and are cleared automatically on `session_shutdown`.
+
+```ts
+pi.on("session_start", async (_event, ctx) => {
+  const timer = ctx.setInterval(() => {
+    // A throw here is contained — it will not crash the session.
+    ctx.ui.notify("tick", "info");
+  }, 60_000);
+  // Optional: clear it yourself; otherwise it is cleared on shutdown.
+  pi.on("session_shutdown", () => ctx.clearTimer(timer));
+});
+```
+
+If you use raw `setInterval`/`setTimeout` or detached promises instead, you own the isolation: wrap the callback body in your own `try/catch` (an unhandled throw will take down the session) and clear the timer on `session_shutdown`.
 
 ### Model selection (`ctx.models`)
 
@@ -167,7 +194,7 @@ Handlers and tool `execute` receive `ctx` with:
 
 - `list()` — authenticated models available this session.
 - `current()` — the live session model (read lazily, so it reflects `/model` switches).
-- `resolve(spec)` — a model string (`provider/id`, bare id) or role alias (`pi/slow`, a configured role) → `Model`, honoring the same settings-backed aliases and match preferences as `--model`. Returns `undefined` when nothing matches.
+- `resolve(spec)` — a model string (`provider/id`, bare id) or role alias (`@slow`, a configured role) → `Model`, honoring the same settings-backed aliases and match preferences as `--model`. Returns `undefined` when nothing matches.
 - `family(model)` — an opaque lineage token for "same family?" checks (Claude point releases share a token; Claude and GPT differ). Compare it; don't persist it (the vocabulary tracks new releases).
 
 ```ts

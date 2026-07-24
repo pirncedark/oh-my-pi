@@ -1,14 +1,21 @@
 import { type ApiKey, type ApiKeyResolver, type AuthStorage, withAuth } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
+import { resolveXAIHttpTransport, type XAIHttpProvider, type XAIHttpTransport } from "../../../lib/xai-http";
 import type { SearchCitation, SearchResponse, SearchSource, SearchUsage } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
+import { formatQuery, parseSearchQuery, type QuerySyntax } from "../query";
 import { clampNumResults } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
-const XAI_RESPONSES_URL = "https://api.x.ai/v1/responses";
-const XAI_WEB_SEARCH_MODEL = "grok-4.3";
+const XAI_DEFAULT_BASE_URL = "https://api.x.ai/v1";
+const XAI_WEB_SEARCH_MODEL = "grok-4.5";
+// grok-4.5 defaults reasoning.effort to "high"; xAI documents "low" for
+// latency-sensitive agentic use and simple tool calling
+// (docs.x.ai/developers/model-capabilities/text/reasoning). Web search is
+// exactly that and runs under a 60s hard timeout, so pin the search calls low.
+const XAI_WEB_SEARCH_REASONING_EFFORT = "low";
 const DEFAULT_NUM_RESULTS = 10;
 const MAX_NUM_RESULTS = 30;
 
@@ -51,14 +58,61 @@ interface XAIResponsesResponse {
 	usage?: XAIResponsesUsage | null;
 }
 
+/**
+ * Query syntax re-emitted for the Grok search agent. `site:`/`-site:` are
+ * stripped because hosts map natively onto the web_search domain filters;
+ * `before:`/`after:` stay in the query text — the Responses web_search tool
+ * has no date parameters (`from_date`/`to_date` exist only on `x_search` and
+ * the deprecated Live Search `search_parameters`, which now returns 410) and
+ * the agent honors the tokens as natural-language hints.
+ */
+const XAI_QUERY_SYNTAX: QuerySyntax = {
+	phrases: true,
+	negation: true,
+	or: true,
+	inUrl: true,
+	inTitle: true,
+	filetype: true,
+	dateRange: true,
+};
+
+/** xAI web_search accepts at most 5 allowed or excluded domains per request. */
+const MAX_DOMAIN_FILTERS = 5;
+
+/** Bare hosts of `site:` values (`github.com/anthropics` → `github.com`), deduped, capped at 5; path parts are enforced by the central constraint filter. */
+function domainFilterList(sites: readonly string[]): string[] {
+	const hosts = new Set<string>();
+	for (const site of sites) {
+		const slash = site.indexOf("/");
+		hosts.add(slash === -1 ? site : site.slice(0, slash));
+		if (hosts.size === MAX_DOMAIN_FILTERS) break;
+	}
+	return [...hosts];
+}
+
 function buildRequestBody(params: SearchParams): Record<string, unknown> {
+	const parsed = params.parsedQuery ?? parseSearchQuery(params.query);
+	const webSearchTool: Record<string, unknown> = { type: "web_search" };
+	let query = params.query;
+	if (parsed.hasDirectives) {
+		query = formatQuery(parsed, XAI_QUERY_SYNTAX);
+		// allowed_domains and excluded_domains are mutually exclusive per
+		// request; prefer the allow list, the central filter enforces exclusions.
+		if (parsed.sites.length > 0) {
+			webSearchTool.filters = { allowed_domains: domainFilterList(parsed.sites) };
+		} else if (parsed.excludedSites.length > 0) {
+			webSearchTool.filters = { excluded_domains: domainFilterList(parsed.excludedSites) };
+		}
+	}
+
 	const body: Record<string, unknown> = {
 		model: XAI_WEB_SEARCH_MODEL,
 		input: [
 			{ role: "system", content: params.systemPrompt },
-			{ role: "user", content: params.query },
+			{ role: "user", content: query },
 		],
-		tools: [{ type: "web_search" }],
+		tools: [webSearchTool],
+		reasoning: { effort: XAI_WEB_SEARCH_REASONING_EFFORT },
 	};
 
 	if (params.maxOutputTokens !== undefined) {
@@ -75,10 +129,12 @@ async function postXAIResponses(
 	apiKey: string,
 	params: SearchParams,
 	body: Record<string, unknown>,
+	transport: XAIHttpTransport,
 ): Promise<Response> {
-	return (params.fetch ?? fetch)(XAI_RESPONSES_URL, {
+	return (params.fetch ?? fetch)(`${transport.baseURL.replace(/\/+$/, "")}/responses`, {
 		method: "POST",
 		headers: {
+			...transport.headers,
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${apiKey}`,
 		},
@@ -93,9 +149,13 @@ function throwXAIResponsesError(status: number, errorText: string): never {
 	throw new SearchProviderError("xai", `xAI Responses API error (${status}): ${errorText}`, status);
 }
 
-async function callXAIResponses(apiKey: string, params: SearchParams): Promise<XAIResponsesResponse> {
+async function callXAIResponses(
+	apiKey: string,
+	params: SearchParams,
+	transport: XAIHttpTransport,
+): Promise<XAIResponsesResponse> {
 	const requestBody = buildRequestBody(params);
-	const response = await postXAIResponses(apiKey, params, requestBody);
+	const response = await postXAIResponses(apiKey, params, requestBody, transport);
 
 	if (!response.ok) {
 		throwXAIResponsesError(response.status, await response.text());
@@ -235,19 +295,24 @@ function shouldPreferXAIOAuth(authStorage: AuthStorage): boolean {
 	return true;
 }
 
-function resolveXAIWebSearchApiKey(params: SearchParams): ApiKeyResolver {
+interface XAIWebSearchAuth {
+	provider: XAIHttpProvider;
+	keyOrResolver: ApiKey;
+}
+
+function resolveXAIWebSearchAuth(params: SearchParams): XAIWebSearchAuth {
 	const xaiResolver = params.authStorage.resolver("xai", {
 		sessionId: params.sessionId,
 	});
 	const xaiOAuthOrigin = params.authStorage.getCredentialOrigin("xai-oauth");
 	if (!shouldPreferXAIOAuth(params.authStorage)) {
-		return xaiResolver;
+		return { provider: "xai", keyOrResolver: xaiResolver };
 	}
 
 	const xaiOAuthResolver = params.authStorage.resolver("xai-oauth", {
 		sessionId: params.sessionId,
 	});
-	return async ctx => {
+	const keyOrResolver: ApiKeyResolver = async ctx => {
 		const xaiOAuthKey = await xaiOAuthResolver(ctx);
 		if (xaiOAuthKey) {
 			const borrowedSharedEnvKey =
@@ -259,14 +324,33 @@ function resolveXAIWebSearchApiKey(params: SearchParams): ApiKeyResolver {
 		}
 		return xaiResolver(ctx);
 	};
+	return { provider: "xai-oauth", keyOrResolver };
 }
 
 /** Execute xAI Responses API web search. */
 export async function searchXAI(params: SearchParams): Promise<SearchResponse> {
-	const keyOrResolver: ApiKey = resolveXAIWebSearchApiKey(params);
+	const auth = resolveXAIWebSearchAuth(params);
+	const transport = params.modelRegistry
+		? resolveXAIHttpTransport(params.modelRegistry, auth.provider, XAI_WEB_SEARCH_MODEL)
+		: { baseURL: XAI_DEFAULT_BASE_URL };
+	const customEndpoint = transport.baseURL.replace(/\/+$/, "") !== XAI_DEFAULT_BASE_URL;
+	const credentialOrigin = params.authStorage.getCredentialOrigin(auth.provider);
+	if (
+		customEndpoint &&
+		auth.provider === "xai-oauth" &&
+		(credentialOrigin?.kind === "oauth" || credentialOrigin?.kind === "env")
+	) {
+		throw new SearchProviderError(
+			"xai",
+			`Refusing to send official xAI OAuth credentials to custom endpoint ${transport.baseURL}. Configure an API key for provider "xai-oauth".`,
+		);
+	}
+	const keyOrResolver: ApiKey = customEndpoint
+		? params.authStorage.resolver(auth.provider, { sessionId: params.sessionId })
+		: auth.keyOrResolver;
 
 	const resultCap = clampNumResults(params.numSearchResults ?? params.limit, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
-	const response = await withAuth(keyOrResolver, (key: string) => callXAIResponses(key, params), {
+	const response = await withAuth(keyOrResolver, (key: string) => callXAIResponses(key, params, transport), {
 		signal: params.signal,
 		missingKeyMessage: 'xAI credentials not found. Set XAI_API_KEY or configure an API key for provider "xai".',
 	});

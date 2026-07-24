@@ -121,12 +121,16 @@ async function loadBrowsers(): Promise<typeof BrowsersNs> {
 }
 
 /**
- * Lazily download Chromium on first browser launch via @puppeteer/browsers.
- * Skipped when a system Chromium (NixOS) or PUPPETEER_EXECUTABLE_PATH is set.
- * The browser is cached under ~/.omp/puppeteer (getPuppeteerDir).
+ * Resolve the Chromium executable puppeteer will launch, lazily downloading it
+ * on first use via @puppeteer/browsers. Skipped when a system Chromium (NixOS)
+ * or PUPPETEER_EXECUTABLE_PATH is set. The browser is cached under
+ * ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when platform
+ * detection fails (puppeteer default resolution takes over). Exported so
+ * real-browser tests can probe launchability and skip on hosts missing
+ * Chrome's system libraries.
  */
 let chromiumExecutablePromise: Promise<string | undefined> | undefined;
-async function ensureChromiumExecutable(): Promise<string | undefined> {
+export async function ensureChromiumExecutable(): Promise<string | undefined> {
 	const sysChrome = resolveSystemChromium();
 	if (sysChrome) return sysChrome;
 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
@@ -271,9 +275,14 @@ function resolveSystemChromium(): string | undefined {
 	return undefined;
 }
 
+/** Options shared by headless Chromium consumers. */
 export interface LaunchHeadlessOptions {
 	headless: boolean;
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
+	/** Additional Chromium arguments merged with the centralized launch defaults. */
+	args?: readonly string[];
+	/** Additional exact Puppeteer default arguments to suppress. */
+	ignoreDefaultArgs?: readonly string[];
 }
 
 export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<Browser> {
@@ -304,13 +313,16 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 	if (ignoreCert === "true" || ignoreCert === "1" || ignoreCert === "yes" || ignoreCert === "on") {
 		launchArgs.push("--ignore-certificate-errors");
 	}
+	for (const arg of opts.args ?? []) {
+		if (!launchArgs.includes(arg)) launchArgs.push(arg);
+	}
 	const executablePath = await ensureChromiumExecutable();
 	return await puppeteer.launch({
 		headless: opts.headless,
 		defaultViewport: opts.headless ? initialViewport : null,
 		executablePath,
 		args: launchArgs,
-		ignoreDefaultArgs: stealthIgnoreDefaultArgs(executablePath),
+		ignoreDefaultArgs: [...new Set([...stealthIgnoreDefaultArgs(executablePath), ...(opts.ignoreDefaultArgs ?? [])])],
 		protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 	});
 }

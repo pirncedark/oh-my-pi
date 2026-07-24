@@ -1,6 +1,7 @@
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { supportsAllTurnsReasoningContext, supportsCodexReasoningSummary } from "@oh-my-pi/pi-catalog/identity";
 import { requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
+import { $env } from "@oh-my-pi/pi-utils";
 import type { Model } from "../../types";
 import { mapOpenAIReasoningEffort } from "../openai-shared";
 
@@ -8,7 +9,7 @@ import { mapOpenAIReasoningEffort } from "../openai-shared";
 export type CodexReasoningContext = "auto" | "current_turn" | "all_turns";
 
 /** User-facing effort levels accepted by Codex request options. */
-type CodexCallerEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+type CodexCallerEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 /** Caller literal → catalog `Effort` bridge (the enum is nominal). */
 const EFFORT_BY_NAME: Record<CodexCallerEffort, Effort> = {
@@ -17,6 +18,7 @@ const EFFORT_BY_NAME: Record<CodexCallerEffort, Effort> = {
 	medium: Effort.Medium,
 	high: Effort.High,
 	xhigh: Effort.XHigh,
+	max: Effort.Max,
 };
 
 export interface ReasoningConfig {
@@ -28,14 +30,19 @@ export interface ReasoningConfig {
 }
 
 export interface CodexRequestOptions {
-	/** User-facing effort; the wire-only `max` tier is reached via the model's effort map. */
+	/** User-facing effort; maps 1:1 onto the wire tier of the same name. */
 	reasoningEffort?: CodexCallerEffort | "none";
 	reasoningSummary?: ReasoningConfig["summary"] | null;
-	/** Explicit `reasoning.context` override; defaults to `all_turns` when unset. The `all_turns` value is gated to gpt-5.4+ Codex models — older ids reject it, so it is suppressed and `context` omitted. */
+	/** Explicit `reasoning.context` override; defaults to `all_turns` when unset. Gated to gpt-5.4+ Codex models (older ids reject it, so it is suppressed and `context` omitted). Note that under Responses Lite (`responsesLite`), the server strictly requires `reasoning.context` to be `all_turns`, which overrides this option and forces `all_turns`. */
 	reasoningContext?: CodexReasoningContext;
 	textVerbosity?: "low" | "medium" | "high";
 	include?: string[];
-	/** Responses Lite transport contract: strips image detail and disables parallel tool calling, mirroring codex-rs. */
+	/**
+	 * Responses Lite transport override; defaults to the model's
+	 * `useResponsesLite`. Lite moves instructions/tools into input items,
+	 * strips image detail, and disables parallel tool calling (codex-rs
+	 * `use_responses_lite`).
+	 */
 	responsesLite?: boolean;
 }
 
@@ -48,6 +55,12 @@ export interface InputItem {
 	name?: string;
 	output?: unknown;
 	arguments?: unknown;
+	action?: unknown;
+	actions?: unknown;
+	pending_safety_checks?: unknown;
+	acknowledged_safety_checks?: unknown;
+	/** `additional_tools` developer item payload (Responses Lite). */
+	tools?: unknown;
 }
 
 export interface RequestBody {
@@ -58,6 +71,8 @@ export interface RequestBody {
 	input?: InputItem[];
 	tools?: unknown;
 	tool_choice?: unknown;
+	/** Concurrent reasoning-summary delivery (codex-rs `StreamOptions`). */
+	stream_options?: { reasoning_summary_delivery: "sequential_cutoff" };
 	// Sampling controls (temperature/top_p/top_k/min_p/presence_penalty/
 	// repetition_penalty/frequency_penalty/stop) are intentionally absent: the
 	// Codex backend rejects every one with a 400 `Unsupported parameter`, so
@@ -76,29 +91,28 @@ export interface RequestBody {
 	[key: string]: unknown;
 }
 
-function containsInputImage(value: unknown): boolean {
-	if (!value || typeof value !== "object") return false;
-	if ((value as { type?: unknown }).type === "input_image") return true;
-	if (Array.isArray(value)) {
-		for (const item of value) {
-			if (containsInputImage(item)) return true;
-		}
-		return false;
-	}
-	for (const item of Object.values(value)) {
-		if (containsInputImage(item)) return true;
-	}
-	return false;
-}
-
-/** Returns whether a Codex request can use the text-only Responses Lite transport. */
-export function shouldUseCodexResponsesLite(body: RequestBody, requested: boolean | undefined): boolean {
-	return requested === true && !containsInputImage(body.input);
+/**
+ * Resolve whether a Codex request uses the Responses Lite transport: an
+ * explicit option wins, then the `PI_CODEX_RESPONSES_LITE` env override
+ * (`1`/`true` forces Lite, `0`/`false` forces the full Responses body),
+ * otherwise the model's catalog flag (codex-rs `model_info.use_responses_lite`)
+ * decides.
+ */
+export function resolveCodexResponsesLite(
+	model: Model<"openai-codex-responses">,
+	requested: boolean | undefined,
+): boolean {
+	if (requested !== undefined) return requested;
+	const env = $env.PI_CODEX_RESPONSES_LITE?.trim().toLowerCase();
+	if (env === "1" || env === "true") return true;
+	if (env === "0" || env === "false") return false;
+	return model.useResponsesLite === true;
 }
 
 /**
  * Clamp a user-facing effort to the model's ladder, then remap to the wire
- * tier (e.g. GPT-5.6's shifted five-tier scale sends `max` for user `xhigh`).
+ * tier. User efforts map 1:1 onto wire tiers; the effort map only covers
+ * host quirks where a wire tier genuinely does not exist (e.g. `minimal→none`).
  * A mapped value outside the Codex wire vocabulary is a broken compat/model
  * effort map — fail loudly rather than silently sending a different tier.
  */
@@ -148,6 +162,7 @@ function filterInput(input: InputItem[] | undefined): InputItem[] | undefined {
 	return input
 		.filter(item => item.type !== "item_reference")
 		.map(item => {
+			if (item.type === "computer_call") return item;
 			if (item.id != null) {
 				const { id: _id, ...rest } = item;
 				return rest as InputItem;
@@ -181,6 +196,22 @@ function orphanFunctionOutputToMessage(item: InputItem, callId: string): InputIt
 	} as InputItem;
 }
 
+type ToolCallKind = "function" | "custom" | "computer";
+
+function toolCallKind(type: unknown): ToolCallKind | undefined {
+	if (type === "function_call") return "function";
+	if (type === "custom_tool_call") return "custom";
+	if (type === "computer_call") return "computer";
+	return undefined;
+}
+
+function toolOutputKind(type: unknown): ToolCallKind | undefined {
+	if (type === "function_call_output") return "function";
+	if (type === "custom_tool_call_output") return "custom";
+	if (type === "computer_call_output") return "computer";
+	return undefined;
+}
+
 /**
  * Repair both halves of unpaired tool exchanges so the Responses input grammar
  * stays valid — the API rejects either orphan with a 400:
@@ -196,43 +227,44 @@ function orphanFunctionOutputToMessage(item: InputItem, callId: string): InputIt
  *   is aborted/crashes after the call streamed but before its result persisted.
  */
 function repairToolCallPairs(input: InputItem[]): InputItem[] {
-	const callIds = new Set<string>();
-	const outputCallIds = new Set<string>();
+	const callKinds = new Map<string, ToolCallKind>();
+	const outputKinds = new Map<string, ToolCallKind>();
 	for (const item of input) {
 		const callId = typeof item.call_id === "string" ? item.call_id : undefined;
 		if (callId === undefined) continue;
-		if (item.type === "function_call" || item.type === "custom_tool_call") callIds.add(callId);
-		else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
-			outputCallIds.add(callId);
-		}
+		const callKind = toolCallKind(item.type);
+		const outputKind = toolOutputKind(item.type);
+		if (callKind) callKinds.set(callId, callKind);
+		if (outputKind) outputKinds.set(callId, outputKind);
 	}
 
 	const repaired: InputItem[] = [];
 	for (const item of input) {
 		const callId = typeof item.call_id === "string" ? item.call_id : undefined;
+		const callKind = toolCallKind(item.type);
+		const outputKind = toolOutputKind(item.type);
 
-		if (
-			(item.type === "function_call_output" || item.type === "custom_tool_call_output") &&
-			callId !== undefined &&
-			!callIds.has(callId)
-		) {
+		if (outputKind && callId !== undefined && callKinds.get(callId) !== outputKind) {
 			repaired.push(orphanFunctionOutputToMessage(item, callId));
 			continue;
 		}
-
-		repaired.push(item);
-
-		if (
-			(item.type === "function_call" || item.type === "custom_tool_call") &&
-			callId !== undefined &&
-			!outputCallIds.has(callId)
-		) {
-			repaired.push({
-				type: item.type === "custom_tool_call" ? "custom_tool_call_output" : "function_call_output",
+		if (callKind && callId !== undefined && outputKinds.get(callId) !== callKind) {
+			if (callKind === "computer") {
+				repaired.push({
+					type: "message",
+					role: "assistant",
+					content: `[Computer call interrupted before a screenshot was recorded; call_id=${callId}]`,
+				});
+				continue;
+			}
+			repaired.push(item, {
+				type: callKind === "custom" ? "custom_tool_call_output" : "function_call_output",
 				call_id: callId,
 				output: CODEX_INTERRUPTED_TOOL_OUTPUT,
-			} as InputItem);
+			});
+			continue;
 		}
+		repaired.push(item);
 	}
 	return repaired;
 }
@@ -242,22 +274,69 @@ function repairToolCallPairs(input: InputItem[]): InputItem[] {
  * `detail` from every input image (message content and tool outputs) before
  * sending, letting the server choose.
  */
-function stripImageDetails(input: InputItem[]): void {
+function stripImageDetails(input: unknown[]): void {
 	for (const item of input) {
-		for (const collection of [item.content, item.output]) {
+		if (!item || typeof item !== "object") continue;
+		const content = "content" in item ? item.content : undefined;
+		const output = "output" in item ? item.output : undefined;
+		for (const collection of [content, output]) {
 			if (!Array.isArray(collection)) continue;
 			for (const part of collection) {
-				if (
-					part &&
-					typeof part === "object" &&
-					(part as { type?: unknown }).type === "input_image" &&
-					"detail" in part
-				) {
-					part.detail = undefined;
-				}
+				if (!part || typeof part !== "object") continue;
+				if (!("type" in part) || part.type !== "input_image") continue;
+				if ("detail" in part) part.detail = undefined;
 			}
 		}
 	}
+}
+
+/**
+ * Structural view of a Responses-style body mutated by the Lite rewrite.
+ * Loose (`unknown`) property types let the turn transformer (`RequestBody`)
+ * and the agent's remote-compaction payloads reuse one shaper.
+ */
+export interface CodexLiteShapedBody {
+	instructions?: unknown;
+	tools?: unknown;
+	tool_choice?: unknown;
+	input?: unknown;
+	parallel_tool_calls?: unknown;
+}
+
+/**
+ * Applies the Responses Lite body contract in place (codex-rs
+ * `build_responses_request` with `use_responses_lite`): strips pinned image
+ * detail, forces parallel tool calling off, moves tools into a leading
+ * `additional_tools` developer item and the base instructions into a
+ * developer message, then omits top-level `instructions`/`tools`. Because the
+ * rewrite removes top-level `tools`, a forced hosted-tool choice (e.g.
+ * `{ type: "web_search" }`) would leave the backend unable to validate the
+ * choice against a tools collection and it rejects the request with HTTP 400
+ * (#5771). Such choices must fall back to `"auto"`; explicit string constraints
+ * such as `"none"` and `"required"` remain valid. Shared by normal turns and
+ * both remote-compaction paths — codex-rs routes `/responses/compact` through
+ * the same builder.
+ */
+export function applyCodexResponsesLiteShape(body: CodexLiteShapedBody): void {
+	const input = Array.isArray(body.input) ? body.input : [];
+	stripImageDetails(input);
+	body.parallel_tool_calls = false;
+	const prefix: InputItem[] = [
+		{ type: "additional_tools", role: "developer", tools: Array.isArray(body.tools) ? body.tools : [] },
+	];
+	if (typeof body.instructions === "string" && body.instructions.length > 0) {
+		prefix.push({
+			type: "message",
+			role: "developer",
+			content: [{ type: "input_text", text: body.instructions }],
+		});
+	}
+	body.input = [...prefix, ...input];
+	if (body.tool_choice !== "none" && body.tool_choice !== "required") {
+		body.tool_choice = "auto";
+	}
+	delete body.instructions;
+	delete body.tools;
 }
 
 export async function transformRequestBody(
@@ -333,20 +412,14 @@ export async function transformRequestBody(
 		}
 	}
 
-	const responsesLite = shouldUseCodexResponsesLite(body, options.responsesLite);
+	const responsesLite = resolveCodexResponsesLite(model, options.responsesLite);
 	if (responsesLite) {
-		if (Array.isArray(body.input)) {
-			stripImageDetails(body.input);
-		}
-		// Responses Lite does not support parallel tool calling; codex-rs forces
-		// it off (`prompt.parallel_tool_calls && !use_responses_lite`).
-		if (body.tools !== undefined) {
-			body.parallel_tool_calls = false;
-		}
+		applyCodexResponsesLiteShape(body);
 	}
 
-	if (options.reasoningEffort !== undefined) {
-		const reasoningConfig = getReasoningConfig(model, options.reasoningEffort, options);
+	if (options.reasoningEffort !== undefined || responsesLite) {
+		const reasoningConfig =
+			options.reasoningEffort !== undefined ? getReasoningConfig(model, options.reasoningEffort, options) : {};
 		body.reasoning = {
 			...body.reasoning,
 			...reasoningConfig,
@@ -360,7 +433,8 @@ export async function transformRequestBody(
 		// default. The version gate is authoritative: even an explicit
 		// `all_turns` override is suppressed on unsupported models, while
 		// `current_turn`/`auto` (universally supported) always pass through.
-		const context = options.reasoningContext ?? "all_turns";
+		// Note: Responses Lite forces `all_turns` to satisfy the transport's server invariant.
+		const context = responsesLite ? "all_turns" : (options.reasoningContext ?? "all_turns");
 		if (context === "all_turns" && !supportsAllTurnsReasoningContext(model.id)) {
 			delete body.reasoning.context;
 		} else {
@@ -376,9 +450,20 @@ export async function transformRequestBody(
 		body.reasoning = { ...body.reasoning, mode: model.reasoningMode };
 	}
 
+	// Concurrent reasoning summaries (codex-rs `concurrent_reasoning_summaries`
+	// feature): `sequential_cutoff` lets the server stream output without
+	// blocking on summary generation. Only meaningful when a summary is
+	// requested; codex-rs additionally gates on its OpenAI provider check,
+	// which is inherent here.
+	if (body.reasoning?.summary !== undefined) {
+		body.stream_options = { reasoning_summary_delivery: "sequential_cutoff" };
+	} else {
+		delete body.stream_options;
+	}
+
 	body.text = {
 		...body.text,
-		verbosity: options.textVerbosity || "high",
+		verbosity: options.textVerbosity || "medium",
 	};
 
 	const include = Array.isArray(options.include) ? [...options.include] : [];

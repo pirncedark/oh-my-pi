@@ -32,6 +32,11 @@ describe("AIError.classify — structural provider errors", () => {
 		).toBe(true);
 	});
 
+	it("classifies a typed AWS credential-resolution failure as authFailed", () => {
+		const id = AIError.classify(new AIError.AwsCredentialsError("opaque provider setup failure", "resolution"));
+		expect(AIError.is(id, AIError.Flag.AuthFailed)).toBe(true);
+	});
+
 	it("maps the usage_limit_reached code to usageLimit on a 429", () => {
 		const id = AIError.classify(
 			new AIError.ProviderHttpError("Payment Required", 429, { code: "usage_limit_reached" }),
@@ -59,6 +64,19 @@ describe("AIError.classify — structural provider errors", () => {
 			"Google API stream ended without a finish reason (connection dropped or response truncated)",
 			{ provider: "google", kind: "incomplete-stream" },
 		);
+		const id = AIError.classify(err);
+		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
+		expect(AIError.retriable(id)).toBe(true);
+	});
+
+	it("classifies an empty provider response as transient + retryable", () => {
+		// Regression: "Cloud Code Assist API returned an empty response" matched no
+		// text pattern and empty-body carried no flag, so retry/model-fallback
+		// chains never engaged and the turn hard-failed.
+		const err = new AIError.ProviderResponseError("Cloud Code Assist API returned an empty response", {
+			provider: "google-antigravity",
+			kind: "empty-body",
+		});
 		const id = AIError.classify(err);
 		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
 		expect(AIError.retriable(id)).toBe(true);
@@ -116,5 +134,19 @@ describe("aierr flag helpers", () => {
 	it("treats transient and usageLimit ids as retryable", () => {
 		expect(AIError.retriable(AIError.create(AIError.Flag.Transient))).toBe(true);
 		expect(AIError.retriable(AIError.create(AIError.Flag.UsageLimit))).toBe(true);
+	});
+
+	it("recognizes explicit transient stream parse diagnostics without broad text false positives", () => {
+		const message = "JSON Parse error: Unterminated string";
+		expect(AIError.isTransientStreamParseError(new Error(message))).toBe(true);
+		expect(AIError.isTransientStreamParseError(new Error("response truncated"))).toBe(true);
+		expect(AIError.isTransientStreamParseError(message)).toBe(true);
+		expect(AIError.isTransientStreamParseError("Unexpected end of JSON input")).toBe(true);
+		expect(AIError.isTransientStreamParseError("JSON.parse: unexpected end of data at line 1 column 8")).toBe(true);
+		expect(AIError.isTransientStreamParseError("Unexpected EOF")).toBe(true);
+		expect(AIError.isTransientStreamParseError("EOF while parsing")).toBe(true);
+		expect(AIError.isTransientStreamParseError("truncated")).toBe(false);
+		expect(AIError.isTransientStreamParseError("end of file")).toBe(false);
+		expect(AIError.isTransientStreamParseError("Unexpected token in JSON")).toBe(false);
 	});
 });

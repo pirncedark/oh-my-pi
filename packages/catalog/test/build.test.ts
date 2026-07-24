@@ -282,6 +282,31 @@ describe("openai-completions wire-quirk compat detection", () => {
 		expect(buildOpenAICompat(completionsSpec()).reasoningDeltasMayBeCumulative).toBe(false);
 	});
 
+	it("extends the reasoning stream idle floor to Kimi K2.6 and K2.7 Code, not other reasoning models", () => {
+		const kimiOverrides = {
+			provider: "moonshot",
+			baseUrl: "https://api.moonshot.ai/v1",
+			reasoning: true,
+		} as const;
+		expect(buildOpenAICompat(completionsSpec({ ...kimiOverrides, id: "kimi-k2.6" })).streamIdleTimeoutMs).toBe(
+			300_000,
+		);
+		expect(buildOpenAICompat(completionsSpec({ ...kimiOverrides, id: "kimi-k2.7-code" })).streamIdleTimeoutMs).toBe(
+			300_000,
+		);
+		expect(
+			buildOpenAICompat(completionsSpec({ ...kimiOverrides, id: "kimi-k2.7-code-highspeed" })).streamIdleTimeoutMs,
+		).toBe(300_000);
+		// K2.7 Code on non-native OpenAI-compatible hosts keeps their default.
+		expect(
+			buildOpenAICompat(completionsSpec({ id: "kimi-k2.7-code", reasoning: true })).streamIdleTimeoutMs,
+		).toBeUndefined();
+		// A non-Kimi reasoning model on a generic host keeps the runtime default.
+		expect(
+			buildOpenAICompat(completionsSpec({ id: "some-reasoner", reasoning: true })).streamIdleTimeoutMs,
+		).toBeUndefined();
+	});
+
 	it("maps the remaining provider-keyed wire quirks", () => {
 		expect(buildOpenAICompat(completionsSpec({ provider: "ollama" })).emptyLengthFinishIsContextError).toBe(true);
 		expect(buildOpenAICompat(completionsSpec()).emptyLengthFinishIsContextError).toBe(false);
@@ -295,6 +320,36 @@ describe("openai-completions wire-quirk compat detection", () => {
 				.dropThinkingWhenReasoningEffort,
 		).toBe(true);
 		expect(buildOpenAICompat(completionsSpec()).dropThinkingWhenReasoningEffort).toBe(false);
+	});
+
+	it("floors the stream timeout for a loopback litellm proxy without enabling reasoning replay (#4786)", () => {
+		// A litellm proxy on a loopback baseUrl fronts a local llama-server whose
+		// prefill can exceed the 100s default first-event budget on large prompts.
+		// The proxy carve-out (which keeps `replayReasoningContent` off so the
+		// field is never forwarded to an unrelated cloud upstream) must NOT also
+		// strip the widened stream-timeout floor, or the turn aborts and
+		// retry-loops during a slow reprocess.
+		const loopback = buildOpenAICompat(
+			completionsSpec({ provider: "litellm", id: "qwen3", baseUrl: "http://127.0.0.1:4000/v1" }),
+		);
+		expect(loopback.streamIdleTimeoutMs).toBe(300_000);
+		expect(loopback.replayReasoningContent).toBe(false);
+
+		// A litellm proxy on a remote baseUrl gets neither: no local upstream to
+		// wait on, and replay would risk a 400 on the cloud upstream.
+		const remote = buildOpenAICompat(
+			completionsSpec({ provider: "litellm", id: "qwen3", baseUrl: "https://litellm.example.com/v1" }),
+		);
+		expect(remote.streamIdleTimeoutMs).toBeUndefined();
+		expect(remote.replayReasoningContent).toBe(false);
+
+		// A first-party local backend (llama.cpp) still gets both the floor and
+		// the reasoning replay it needs for KV-cache reuse.
+		const native = buildOpenAICompat(
+			completionsSpec({ provider: "llama.cpp", id: "qwen3", baseUrl: "http://127.0.0.1:8080/v1" }),
+		);
+		expect(native.streamIdleTimeoutMs).toBe(300_000);
+		expect(native.replayReasoningContent).toBe(true);
 	});
 
 	it("disables the leaked-markup healer for the official OpenAI endpoint only", () => {
@@ -343,6 +398,84 @@ describe("openai-completions wire-quirk compat detection", () => {
 		});
 		expect(openrouterResponses.supportsObfuscationOptOut).toBe(false);
 		expect(openrouterResponses.wireModelIdMode).toBe("openrouter");
+	});
+});
+
+describe("OpenAI explicit prompt-cache breakpoint compat", () => {
+	it("enables the 30-minute breakpoint contract for GPT-5.6+ on the official API", () => {
+		const completions = buildOpenAICompat(
+			completionsSpec({ id: "gpt-5.6", provider: "openai", baseUrl: "https://api.openai.com/v1" }),
+		);
+		const responses = buildOpenAIResponsesCompat({
+			id: "gpt-5.6-mini",
+			provider: "openai",
+			name: "GPT 5.6 Mini",
+			baseUrl: "https://api.openai.com/v1",
+		});
+
+		expect(completions.supportsPromptCacheBreakpoints).toBe(true);
+		expect(completions.promptCacheBreakpointTtl).toBe("30m");
+		expect(responses.supportsPromptCacheBreakpoints).toBe(true);
+		expect(responses.promptCacheBreakpointTtl).toBe("30m");
+
+		expect(
+			buildOpenAICompat(
+				completionsSpec({ id: "gpt-5.6-preview", provider: "openai", baseUrl: "https://api.openai.com/v1" }),
+			).supportsPromptCacheBreakpoints,
+		).toBe(true);
+		expect(
+			buildOpenAICompat(completionsSpec({ id: "gpt-5.7", provider: "openai", baseUrl: "https://api.openai.com/v1" }))
+				.supportsPromptCacheBreakpoints,
+		).toBe(true);
+		expect(
+			buildOpenAIResponsesCompat({
+				id: "gpt-6.1-mini",
+				provider: "openai",
+				name: "GPT 6.1 Mini",
+				baseUrl: "https://api.openai.com/v1",
+			}).supportsPromptCacheBreakpoints,
+		).toBe(true);
+
+		expect(
+			buildOpenAICompat(completionsSpec({ id: "gpt-5.5", provider: "openai", baseUrl: "https://api.openai.com/v1" }))
+				.supportsPromptCacheBreakpoints,
+		).toBe(false);
+		expect(
+			buildOpenAIResponsesCompat({
+				id: "gpt-5.6",
+				provider: "openrouter",
+				name: "GPT 5.6 through OpenRouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+			}).supportsPromptCacheBreakpoints,
+		).toBe(false);
+		expect(
+			buildOpenAIResponsesCompat({
+				id: "gpt-4.1",
+				provider: "openai",
+				name: "GPT 4.1",
+				baseUrl: "https://api.openai.com/v1",
+			}).supportsPromptCacheBreakpoints,
+		).toBe(false);
+		expect(
+			buildOpenAIResponsesCompat({
+				id: "gpt-5.6",
+				provider: "openai",
+				name: "GPT 5.6",
+				baseUrl: "https://api.openai.com.evil/v1",
+			}).supportsPromptCacheBreakpoints,
+		).toBe(false);
+	});
+
+	it("keeps custom endpoint support opt-in", () => {
+		const compat = buildOpenAICompat(
+			completionsSpec({
+				id: "gpt-5.6",
+				compat: { supportsPromptCacheBreakpoints: true, promptCacheBreakpointTtl: "30m" },
+			}),
+		);
+
+		expect(compat.supportsPromptCacheBreakpoints).toBe(true);
+		expect(compat.promptCacheBreakpointTtl).toBe("30m");
 	});
 });
 
@@ -474,6 +607,253 @@ describe("model cache spec round trip", () => {
 			expect(model?.compat.supportsDeveloperRole).toBe(true);
 			expect(model?.compat.isOpenRouterHost).toBe(false);
 			expect(model?.compatConfig).toEqual(sparse);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("uses current static limits for same-id cache rows when the static fingerprint changed", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-static-fingerprint-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const staleSameId = buildModel(
+			completionsSpec({
+				id: "catalog-updated-model",
+				name: "Catalog Updated Model (cached)",
+				provider: "spec-cache-test",
+				contextWindow: 64_000,
+				maxTokens: 4_000,
+			}),
+		);
+		const cachedOnly = buildModel(
+			completionsSpec({
+				id: "cache-only-model",
+				name: "Cache Only Model",
+				provider: "spec-cache-test",
+				contextWindow: 96_000,
+				maxTokens: 6_000,
+			}),
+		);
+		const updatedStatic = completionsSpec({
+			id: staleSameId.id,
+			name: "Catalog Updated Model",
+			provider: "spec-cache-test",
+			contextWindow: 256_000,
+			maxTokens: 32_000,
+		});
+
+		try {
+			writeModelCache(
+				"spec-cache-test",
+				Date.now(),
+				[staleSameId, cachedOnly],
+				true,
+				"merge-v3:stale-static-catalog",
+				dbPath,
+			);
+
+			const offline = await resolveProviderModels<"openai-completions">(
+				{
+					providerId: "spec-cache-test",
+					staticModels: [updatedStatic],
+					cacheDbPath: dbPath,
+				},
+				"offline",
+			);
+
+			const sameId = offline.models.find(candidate => candidate.id === updatedStatic.id);
+			expect(sameId?.contextWindow).toBe(256_000);
+			expect(sameId?.maxTokens).toBe(32_000);
+
+			const cacheOnly = offline.models.find(candidate => candidate.id === cachedOnly.id);
+			expect(cacheOnly?.contextWindow).toBe(96_000);
+			expect(cacheOnly?.maxTokens).toBe(6_000);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("restores static model headers on fresh cache reads", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-static-headers-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const staticModel = completionsSpec({
+			id: "header-static-model",
+			provider: "header-cache-test",
+			headers: { "X-Project-Id": "project-42" },
+		});
+		let fetches = 0;
+		const options = {
+			providerId: "header-cache-test",
+			staticModels: [staticModel],
+			cacheDbPath: dbPath,
+			fetchDynamicModels: async () => {
+				fetches++;
+				return [];
+			},
+		};
+		try {
+			const online = await resolveProviderModels(options, "online");
+			expect(online.models[0]?.headers).toEqual({ "X-Project-Id": "project-42" });
+			expect(fetches).toBe(1);
+
+			const offline = await resolveProviderModels(options, "offline");
+			expect(offline.models[0]?.headers).toEqual({ "X-Project-Id": "project-42" });
+			expect(fetches).toBe(1);
+
+			const fresh = await resolveProviderModels(options, "online-if-uncached");
+			expect(fresh.models[0]?.headers).toEqual({ "X-Project-Id": "project-42" });
+			expect(fetches).toBe(1);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refetches dynamic-only models whose headers cannot be restored", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-dynamic-headers-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const dynamicModel = completionsSpec({
+			id: "header-dynamic-model",
+			provider: "header-cache-test",
+			headers: { "X-Required-Route": "route-42" },
+		});
+		let fetches = 0;
+		const options = {
+			providerId: "header-cache-test",
+			staticModels: [],
+			dynamicModelsAuthoritative: true,
+			cacheDbPath: dbPath,
+			fetchDynamicModels: async () => {
+				fetches++;
+				return [dynamicModel];
+			},
+		};
+		try {
+			const online = await resolveProviderModels(options, "online");
+			expect(online.models[0]?.headers).toEqual({ "X-Required-Route": "route-42" });
+			expect(fetches).toBe(1);
+
+			const fresh = await resolveProviderModels(options, "online-if-uncached");
+			expect(fresh.models[0]?.headers).toEqual({ "X-Required-Route": "route-42" });
+			expect(fetches).toBe(2);
+
+			const offline = await resolveProviderModels(options, "offline");
+			expect(offline.models).toEqual([]);
+			expect(offline.stale).toBe(true);
+			expect(fetches).toBe(2);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a synthesized request-model variant across an offline restart", async () => {
+		// Regression for #6037/#6284: Copilot `-1m` long-context variants are
+		// synthesized dynamically with transport headers and a `requestModelId`
+		// pointing at a same-provider base. Their headers are omitted from the
+		// cache but recoverable from the base's static headers, so they must NOT
+		// be flagged unrestorable and dropped on the next offline read.
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-request-model-variant-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const headers = { "X-GitHub-Api-Version": "2026-06-01" };
+		const base = completionsSpec({ id: "sol", provider: "variant-cache-test", headers });
+		const variant = completionsSpec({
+			id: "sol-1m",
+			provider: "variant-cache-test",
+			requestModelId: "sol",
+			headers,
+			contextWindow: 1_000_000,
+		});
+		const options = {
+			providerId: "variant-cache-test",
+			staticModels: [base],
+			cacheDbPath: dbPath,
+		};
+		try {
+			const online = await resolveProviderModels<"openai-completions">(
+				{ ...options, fetchDynamicModels: async () => [base, variant] },
+				"online",
+			);
+			expect(online.models.find(candidate => candidate.id === "sol-1m")).toBeDefined();
+
+			const offline = await resolveProviderModels<"openai-completions">(
+				{ ...options, fetchDynamicModels: async () => null },
+				"offline",
+			);
+			const restored = offline.models.find(candidate => candidate.id === "sol-1m");
+			expect(restored).toBeDefined();
+			expect(restored?.headers).toEqual(headers);
+			expect(offline.models.find(candidate => candidate.id === "sol")?.headers).toEqual(headers);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refetches a current request-model alias whose headers differ from its static base", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-custom-alias-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const baseHeaders = { "X-Route": "static" };
+		const customHeaders = { "X-Route": "tenant-specific" };
+		const base = completionsSpec({ id: "base", provider: "alias-cache-test", headers: baseHeaders });
+		const aliasSpec = completionsSpec({
+			id: "custom-alias",
+			provider: "alias-cache-test",
+			requestModelId: "base",
+			headers: customHeaders,
+		});
+		const alias = buildModel(aliasSpec);
+		let fetches = 0;
+		const options = {
+			providerId: "alias-cache-test",
+			staticModels: [base],
+			cacheDbPath: dbPath,
+			fetchDynamicModels: async () => {
+				fetches++;
+				return [aliasSpec];
+			},
+		};
+		try {
+			writeModelCache("alias-cache-test", Date.now(), [alias], true, "", dbPath, [buildModel(base)]);
+
+			const refreshed = await resolveProviderModels<"openai-completions">(options, "online-if-uncached");
+			expect(fetches).toBe(1);
+			expect(refreshed.models.find(candidate => candidate.id === alias.id)?.headers).toEqual(customHeaders);
+
+			const offline = await resolveProviderModels<"openai-completions">(options, "offline");
+			expect(offline.models.find(candidate => candidate.id === alias.id)).toBeUndefined();
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("recovers a legacy stale-marked request-model variant via requestModelId", async () => {
+		// Legacy cache rows (written by the old id-only writer) flag `-1m`
+		// variants unrestorable because it never matched their base's headers.
+		// The restore path must still recover them through `requestModelId`.
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-legacy-variant-"));
+		const dbPath = path.join(tempDir, "models.db");
+		const headers = { "X-GitHub-Api-Version": "2026-06-01" };
+		const base = completionsSpec({ id: "sol", provider: "variant-cache-test", headers });
+		const variant = buildModel(
+			completionsSpec({
+				id: "sol-1m",
+				provider: "variant-cache-test",
+				requestModelId: "sol",
+				headers,
+				contextWindow: 1_000_000,
+			}),
+		);
+		try {
+			// Emulate a legacy write: no static header source, so the variant is
+			// flagged unrestorable even though its base carries the headers.
+			writeModelCache("variant-cache-test", Date.now(), [variant], true, "", dbPath);
+			const db = new Database(dbPath);
+			db.run("UPDATE model_cache SET header_restore_version = 0 WHERE provider_id = ?", ["variant-cache-test"]);
+			db.close();
+
+			const offline = await resolveProviderModels<"openai-completions">(
+				{ providerId: "variant-cache-test", staticModels: [base], cacheDbPath: dbPath },
+				"offline",
+			);
+			const restored = offline.models.find(candidate => candidate.id === "sol-1m");
+			expect(restored).toBeDefined();
+			expect(restored?.headers).toEqual(headers);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}

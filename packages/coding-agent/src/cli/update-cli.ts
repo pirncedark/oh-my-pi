@@ -109,6 +109,19 @@ async function getBunGlobalBinDir(): Promise<string | undefined> {
 	}
 }
 
+async function getNpmGlobalBinDir(): Promise<string | undefined> {
+	if (!$which("npm")) return undefined;
+	try {
+		const result = await $`npm prefix -g`.quiet().nothrow();
+		if (result.exitCode !== 0) return undefined;
+		const prefix = result.text().trim();
+		if (prefix.length === 0) return undefined;
+		return process.platform === "win32" ? prefix : path.join(prefix, "bin");
+	} catch {
+		return undefined;
+	}
+}
+
 async function getHomebrewFormulaPrefix(): Promise<string | undefined> {
 	if (!$which("brew")) return undefined;
 	for (const formula of [HOMEBREW_FORMULA, APP_NAME]) {
@@ -189,18 +202,20 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 	return isPathInDirectoryLexical(resolvedFile, dirReal);
 }
 
-type UpdateMethod = "brew" | "mise" | "bun" | "binary" | "source";
+type UpdateMethod = "brew" | "mise" | "bun" | "npm" | "binary" | "source";
 
 interface UpdateMethodResolutionOptions {
 	homebrewPrefix?: string;
 	miseBinDirs?: readonly string[];
 	miseDataDir?: string;
+	npmBinDir?: string;
 }
 
 type UpdateTarget =
 	| { method: "brew" }
 	| { method: "mise" }
 	| { method: "bun" }
+	| { method: "npm" }
 	| { method: "binary"; path: string }
 	| { method: "source"; path: string };
 
@@ -209,13 +224,18 @@ function resolveUpdateMethod(
 	bunBinDir: string | undefined,
 	options: UpdateMethodResolutionOptions = {},
 ): UpdateMethod {
-	const { homebrewPrefix, miseBinDirs = [], miseDataDir } = options;
+	const { homebrewPrefix, miseBinDirs = [], miseDataDir, npmBinDir } = options;
+	const launcherExtension = path.extname(ompPath).toLowerCase();
+	const isWindowsScriptLauncher =
+		launcherExtension === ".cmd" || launcherExtension === ".ps1" || launcherExtension === ".bat";
 	if (homebrewPrefix && isPathInDirectory(ompPath, path.join(homebrewPrefix, "bin"))) return "brew";
 	if (miseBinDirs.some(dir => isPathInDirectory(ompPath, dir))) return "mise";
 	if (miseDataDir && isPathInDirectory(ompPath, path.join(miseDataDir, "shims"))) return "mise";
 	if (bunBinDir && isPathInDirectory(ompPath, bunBinDir)) return "bun";
 
-	// If the resolved binary is actually a script wrapper in a local checkout or points to one
+	// If the resolved binary is actually a script wrapper in a local checkout or points to one,
+	// treat it as a source install (must run before the npm/script-launcher check below, since a
+	// local checkout wrapper can also look like a Windows script launcher).
 	if (
 		ompPath.endsWith(".cmd") ||
 		ompPath.endsWith(".sh") ||
@@ -231,6 +251,7 @@ function resolveUpdateMethod(
 		}
 	}
 
+	if ((npmBinDir && isPathInDirectory(ompPath, npmBinDir)) || isWindowsScriptLauncher) return "npm";
 	return "binary";
 }
 
@@ -243,6 +264,7 @@ export function resolveUpdateMethodForTest(
 }
 async function resolveUpdateTarget(): Promise<UpdateTarget> {
 	const bunBinDir = await getBunGlobalBinDir();
+	const npmBinDir = await getNpmGlobalBinDir();
 	const homebrewPrefix = await getHomebrewFormulaPrefix();
 	const miseAvailable = $which("mise") !== undefined;
 	const miseBinDirs = miseAvailable ? await getMiseBinDirs() : [];
@@ -250,7 +272,7 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 	const ompPath = resolveOmpPath();
 
 	if (ompPath) {
-		const method = resolveUpdateMethod(ompPath, bunBinDir, { homebrewPrefix, miseBinDirs, miseDataDir });
+		const method = resolveUpdateMethod(ompPath, bunBinDir, { homebrewPrefix, miseBinDirs, miseDataDir, npmBinDir });
 		if (method === "binary" || method === "source") return { method, path: ompPath };
 		return { method };
 	}
@@ -555,6 +577,19 @@ async function pruneBunCacheAfterGlobalInstall(): Promise<BunInstallCachePruneRe
 }
 
 /**
+ * Detect a musl-libc Linux host (Alpine, Void-musl) so self-update replaces a
+ * musl binary with the musl release asset instead of the glibc build, which
+ * would fail to start on the next run. Mirrors the detection in
+ * scripts/install.sh.
+ */
+function isMuslLinux(): boolean {
+	if (process.platform !== "linux") return false;
+	if (fs.existsSync("/etc/alpine-release")) return true;
+	const loaderArch = process.arch === "arm64" ? "aarch64" : "x86_64";
+	return fs.existsSync(`/lib/ld-musl-${loaderArch}.so.1`);
+}
+
+/**
  * Get the appropriate binary name for this platform.
  */
 function getBinaryName(): string {
@@ -564,7 +599,7 @@ function getBinaryName(): string {
 	let os: string;
 	switch (platform) {
 		case "linux":
-			os = "linux";
+			os = isMuslLinux() ? "linux-musl" : "linux";
 			break;
 		case "darwin":
 			os = "darwin";
@@ -737,6 +772,14 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	}
 }
 
+function buildVersionedPackageInstallArgs(expectedVersion: string, nativeTag: string): string[] {
+	const args = [`${PACKAGE}@${expectedVersion}`, `${NATIVES_PACKAGE}@${expectedVersion}`];
+	if (SUPPORTED_NATIVE_TAGS.has(nativeTag)) {
+		args.push(`${NATIVES_PACKAGE}-${nativeTag}@${expectedVersion}`);
+	}
+	return args;
+}
+
 /**
  * Build the bun argv used to globally install a specific omp version.
  *
@@ -768,17 +811,23 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
  * See #1824.
  */
 export function buildBunInstallArgs(expectedVersion: string, nativeTag: string = currentNativeTag()): string[] {
-	const args = [
+	return [
 		"install",
 		"-g",
 		"--no-cache",
 		`--registry=${NPM_REGISTRY}`,
-		`${PACKAGE}@${expectedVersion}`,
-		`${NATIVES_PACKAGE}@${expectedVersion}`,
+		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag),
 	];
-	if (SUPPORTED_NATIVE_TAGS.has(nativeTag)) {
-		args.push(`${NATIVES_PACKAGE}-${nativeTag}@${expectedVersion}`);
-	}
+}
+
+/** Build the npm argv used to update npm-managed global installs. */
+export function buildNpmInstallArgs(expectedVersion: string, nativeTag: string = currentNativeTag()): string[] {
+	const args = [
+		"install",
+		"-g",
+		`--registry=${NPM_REGISTRY}`,
+		...buildVersionedPackageInstallArgs(expectedVersion, nativeTag),
+	];
 	return args;
 }
 
@@ -795,7 +844,7 @@ export function buildMiseForceInstallArgs(expectedVersion: string): string[] {
 }
 
 /**
- * Update via bun package manager.
+ * Update via package manager.
  */
 async function updateViaBun(expectedVersion: string): Promise<void> {
 	console.log(chalk.dim("Updating via bun..."));
@@ -814,6 +863,17 @@ async function updateViaBun(expectedVersion: string): Promise<void> {
 	} catch (err) {
 		console.log(chalk.yellow(`Warning: could not prune stale Bun cache entries: ${err}`));
 	}
+}
+
+async function updateViaNpm(expectedVersion: string): Promise<void> {
+	console.log(chalk.dim("Updating via npm..."));
+	const args = buildNpmInstallArgs(expectedVersion);
+	const result = await $`npm ${args}`.nothrow();
+	if (result.exitCode !== 0) {
+		throw new Error(`npm install failed with exit code ${result.exitCode}`);
+	}
+
+	await printVerification(expectedVersion);
 }
 
 async function updateViaHomebrew(expectedVersion: string, force: boolean): Promise<void> {
@@ -989,6 +1049,8 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 			await updateViaMise(release.version, opts.force);
 		} else if (target.method === "bun") {
 			await updateViaBun(release.version);
+		} else if (target.method === "npm") {
+			await updateViaNpm(release.version);
 		} else if (target.method === "source") {
 			await updateViaSource(target.path, release.version);
 		} else {

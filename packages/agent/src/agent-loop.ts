@@ -5,6 +5,8 @@
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
+	type ComputerAction,
+	type ComputerSafetyCheck,
 	type Context,
 	EventStream,
 	isApiKeyResolver,
@@ -12,8 +14,10 @@ import {
 	seedApiKeyResolver,
 	streamSimple,
 	stripSchemaDescriptions,
+	type ToolCallProviderMetadata,
 	type ToolChoice,
 	type ToolResultMessage,
+	type ToolResultProviderMetadata,
 	type TSchema,
 	toolWireSchema,
 	validateToolArguments,
@@ -40,6 +44,7 @@ import {
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { sanitizeText, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { agentPauseGate } from "./pause";
 import { type AgentRunCoverage, type AgentRunSummary, ToolCallBlockedError } from "./run-collector";
 import {
 	type AgentTelemetry,
@@ -66,6 +71,9 @@ import type {
 	AgentToolResult,
 	AgentTurnEndContext,
 	AsideMessage,
+	SoftToolRequirement,
+	SteeringInterruptSource,
+	SteeringQueueState,
 	StreamFn,
 } from "./types";
 import { isSoftToolRequirement } from "./types";
@@ -102,6 +110,7 @@ const MAX_SOFT_TOOL_ESCALATIONS = 3;
 function hardToolChoiceBlocks(choice: ToolChoice | undefined, requiredTool: string): boolean {
 	if (choice === undefined) return false;
 	if (typeof choice === "string") return choice === "none";
+	if (choice.type === "computer") return requiredTool !== "computer";
 	const name = choice.type === "tool" ? choice.name : "function" in choice ? choice.function.name : choice.name;
 	return name !== requiredTool;
 }
@@ -131,6 +140,13 @@ export function createToolScopedAbortReason(
 ): ToolScopedAbortReason {
 	return { kind: "tool-scoped-abort", message, toolCallMessages, defaultToolCallMessage };
 }
+
+/**
+ * Marks an abort raised by a completed post-tool hook as terminal for the
+ * current run. External/user aborts still synthesize an aborted assistant
+ * boundary; this reason stops after persisting the completed tool batch.
+ */
+export const TERMINAL_TOOL_RESULT_ABORT_REASON = Symbol.for("pi-agent-core.terminal-tool-result");
 
 const STEERING_INTERRUPT_POLL_MS = 250;
 
@@ -169,18 +185,179 @@ export function resolveOwnedDialectFromEnv(value: string | undefined): Dialect |
 type AssistantContentBlock = AssistantMessage["content"][number];
 type AssistantToolCallBlock = Extract<AssistantContentBlock, { type: "toolCall" }>;
 
+function snapshotComputerSafetyChecks(value: unknown): ComputerSafetyCheck[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const checks: ComputerSafetyCheck[] = [];
+	for (const raw of value) {
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+		const check = raw as Record<string, unknown>;
+		if (typeof check.id !== "string" || check.id.length === 0) return undefined;
+		if (check.code !== undefined && check.code !== null && typeof check.code !== "string") return undefined;
+		if (check.message !== undefined && check.message !== null && typeof check.message !== "string") return undefined;
+		checks.push({
+			id: check.id,
+			...(check.code !== undefined ? { code: check.code as string | null } : {}),
+			...(check.message !== undefined ? { message: check.message as string | null } : {}),
+		});
+	}
+	return checks;
+}
+
+function isFiniteCoordinate(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+function hasValidComputerKeys(value: unknown, optional: boolean): boolean {
+	return (
+		(optional && value === undefined) ||
+		value === null ||
+		(Array.isArray(value) && value.every(key => typeof key === "string"))
+	);
+}
+
+function snapshotComputerAction(value: unknown): ComputerAction | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const action = value as Record<string, unknown>;
+	switch (action.type) {
+		case "click":
+			if (
+				!(["left", "right", "wheel", "back", "forward"] as unknown[]).includes(action.button) ||
+				!isFiniteCoordinate(action.x) ||
+				!isFiniteCoordinate(action.y) ||
+				!hasValidComputerKeys(action.keys, true)
+			)
+				return undefined;
+			break;
+		case "double_click":
+			if (
+				!isFiniteCoordinate(action.x) ||
+				!isFiniteCoordinate(action.y) ||
+				!hasValidComputerKeys(action.keys, false)
+			)
+				return undefined;
+			break;
+		case "drag":
+			if (
+				!Array.isArray(action.path) ||
+				!action.path.every(
+					point =>
+						point &&
+						typeof point === "object" &&
+						isFiniteCoordinate((point as Record<string, unknown>).x) &&
+						isFiniteCoordinate((point as Record<string, unknown>).y),
+				) ||
+				!hasValidComputerKeys(action.keys, true)
+			)
+				return undefined;
+			break;
+		case "keypress":
+			if (!Array.isArray(action.keys) || !action.keys.every(key => typeof key === "string")) return undefined;
+			break;
+		case "move":
+			if (!isFiniteCoordinate(action.x) || !isFiniteCoordinate(action.y) || !hasValidComputerKeys(action.keys, true))
+				return undefined;
+			break;
+		case "screenshot":
+		case "wait":
+			break;
+		case "scroll":
+			if (
+				!isFiniteCoordinate(action.x) ||
+				!isFiniteCoordinate(action.y) ||
+				!isFiniteCoordinate(action.scroll_x) ||
+				!isFiniteCoordinate(action.scroll_y) ||
+				!hasValidComputerKeys(action.keys, true)
+			)
+				return undefined;
+			break;
+		case "type":
+			if (typeof action.text !== "string") return undefined;
+			break;
+		default:
+			return undefined;
+	}
+	return structuredCloneJSON(action) as ComputerAction;
+}
+
+function snapshotToolCallProviderMetadata(value: unknown): ToolCallProviderMetadata | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const metadata = value as Record<string, unknown>;
+	if (
+		metadata.type !== "computer" ||
+		typeof metadata.providerItemId !== "string" ||
+		metadata.providerItemId.length === 0
+	)
+		return undefined;
+	if (!Array.isArray(metadata.actions) || metadata.actions.length === 0) return undefined;
+	const actions = metadata.actions.map(snapshotComputerAction);
+	if (actions.some(action => action === undefined)) return undefined;
+	const pendingSafetyChecks = snapshotComputerSafetyChecks(metadata.pendingSafetyChecks);
+	if (!pendingSafetyChecks) return undefined;
+	return {
+		type: "computer",
+		providerItemId: metadata.providerItemId,
+		actions: actions as ComputerAction[],
+		pendingSafetyChecks,
+	};
+}
+
+function snapshotToolResultProviderMetadata(value: unknown): {
+	metadata?: ToolResultProviderMetadata;
+	malformed: boolean;
+} {
+	if (value === undefined) return { malformed: false };
+	if (!value || typeof value !== "object" || Array.isArray(value)) return { malformed: true };
+	const metadata = value as Record<string, unknown>;
+	if (
+		metadata.type !== "computer" ||
+		!metadata.screenshot ||
+		typeof metadata.screenshot !== "object" ||
+		Array.isArray(metadata.screenshot)
+	) {
+		return { malformed: true };
+	}
+	const screenshot = metadata.screenshot as Record<string, unknown>;
+	const hasImageUrl = Object.hasOwn(screenshot, "image_url");
+	const hasFileId = Object.hasOwn(screenshot, "file_id");
+	if (screenshot.type !== "computer_screenshot" || hasImageUrl === hasFileId) return { malformed: true };
+	if (hasImageUrl && (typeof screenshot.image_url !== "string" || screenshot.image_url.length === 0))
+		return { malformed: true };
+	if (hasFileId && (typeof screenshot.file_id !== "string" || screenshot.file_id.length === 0))
+		return { malformed: true };
+	const acknowledgedSafetyChecks = snapshotComputerSafetyChecks(metadata.acknowledgedSafetyChecks);
+	if (!acknowledgedSafetyChecks) return { malformed: true };
+	return {
+		malformed: false,
+		metadata: {
+			type: "computer",
+			screenshot: hasImageUrl
+				? { type: "computer_screenshot", image_url: screenshot.image_url as string }
+				: { type: "computer_screenshot", file_id: screenshot.file_id as string },
+			acknowledgedSafetyChecks,
+		},
+	};
+}
+
 function snapshotAssistantContentBlock(block: AssistantContentBlock): AssistantContentBlock {
 	switch (block.type) {
 		case "text":
+		case "image":
 			return { ...block };
 		case "thinking":
 			return { ...block };
 		case "redactedThinking":
 			return { ...block };
+		case "anthropicServerTool":
+			return { ...block, block: structuredCloneJSON(block.block) };
 		case "fallback":
 			return { ...block, from: { ...block.from }, to: { ...block.to } };
 		case "toolCall":
-			return { ...block, arguments: structuredCloneJSON(block.arguments) };
+			return {
+				...block,
+				arguments: structuredCloneJSON(block.arguments),
+				providerMetadata: snapshotToolCallProviderMetadata(block.providerMetadata),
+			};
 	}
 }
 
@@ -213,6 +390,7 @@ function snapshotAssistantMessageEvent(
 		case "text_start":
 		case "text_delta":
 		case "text_end":
+		case "image_end":
 		case "thinking_start":
 		case "thinking_delta":
 		case "thinking_end":
@@ -255,6 +433,10 @@ function coerceToolResult(raw: unknown): { result: AgentToolResult<unknown>; mal
 	const rawObj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
 	const rawContent = rawObj?.content;
 	const details = rawObj && "details" in rawObj ? rawObj.details : {};
+	const providerMetadataResult = snapshotToolResultProviderMetadata(
+		rawObj && "providerMetadata" in rawObj ? rawObj.providerMetadata : undefined,
+	);
+	const providerMetadata = providerMetadataResult.metadata;
 	// Tools may flag a non-throwing failure on the result itself (e.g. an
 	// aggregator that catches per-entry errors and synthesizes a combined
 	// result). Preserve the flag so agent-loop can surface it on the wire.
@@ -299,7 +481,13 @@ function coerceToolResult(raw: unknown): { result: AgentToolResult<unknown>; mal
 			text: `Tool returned an invalid result: ${invalidBlocks} content block${invalidBlocks === 1 ? "" : "s"} had an unsupported shape.`,
 		});
 	}
-	const isError = explicitError || invalidBlocks > 0;
+	if (providerMetadataResult.malformed) {
+		content.push({
+			type: "text",
+			text: "Tool returned an invalid result: computer providerMetadata had an unsupported shape.",
+		});
+	}
+	const isError = explicitError || invalidBlocks > 0 || providerMetadataResult.malformed;
 	// Anthropic rejects tool_result blocks with is_error: true and empty content.
 	if (isError && !hasSubstantiveToolResultContent(content)) {
 		content.length = 0;
@@ -309,10 +497,11 @@ function coerceToolResult(raw: unknown): { result: AgentToolResult<unknown>; mal
 		result: {
 			content,
 			details,
+			providerMetadata,
 			...(isError ? { isError: true } : {}),
 			...(useless && !isError ? { useless: true } : {}),
 		},
-		malformed: invalidBlocks > 0,
+		malformed: invalidBlocks > 0 || providerMetadataResult.malformed,
 	};
 }
 
@@ -756,12 +945,13 @@ async function runLoopBody(
 	let deadlineTimer: Timer | undefined;
 	if (config.deadline !== undefined) {
 		const deadlineAbortController = new AbortController();
+		const deadlineReason = new DOMException("Deadline exceeded", "TimeoutError");
 		const delay = config.deadline - Date.now();
 		if (delay <= 0) {
-			deadlineAbortController.abort("Deadline exceeded");
+			deadlineAbortController.abort(deadlineReason);
 		} else {
 			deadlineTimer = setTimeout(() => {
-				deadlineAbortController.abort("Deadline exceeded");
+				deadlineAbortController.abort(deadlineReason);
 			}, delay);
 		}
 		signal = signal ? AbortSignal.any([signal, deadlineAbortController.signal]) : deadlineAbortController.signal;
@@ -792,6 +982,7 @@ async function runLoopBody(
 		// getToolChoice is never advanced twice; the flag resets at the message boundary.
 		let hostToolChoice: ToolChoice | undefined;
 		let softRequiredTool: string | undefined;
+		let softSatisfies: SoftToolRequirement["satisfies"];
 		let directiveResolvedForTurn = false;
 
 		// Outer loop: continues when queued follow-up messages arrive after agent would stop
@@ -807,6 +998,10 @@ async function runLoopBody(
 				// Yield at the top of each iteration to prevent busy-wait when
 				// the agent loop is executing tool calls back-to-back.
 				await yieldIfDue();
+				// Park at the turn boundary while the process-wide pause gate is
+				// engaged (host /pause). An external abort releases the park so a
+				// cancelled run still unwinds while everything else stays frozen.
+				if (agentPauseGate.paused) await agentPauseGate.waitUntilResumed(signal);
 				if (!firstTurn) {
 					stream.push({ type: "turn_start" });
 				} else {
@@ -846,6 +1041,7 @@ async function runLoopBody(
 					const softReq = isSoftToolRequirement(directive) ? directive : undefined;
 					hostToolChoice = directive === undefined || isSoftToolRequirement(directive) ? undefined : directive;
 					softRequiredTool = softReq?.toolName;
+					softSatisfies = softReq?.satisfies;
 					if (softReq !== undefined) {
 						if (softReq.id !== softRequirementId) {
 							softRequirementId = softReq.id;
@@ -1009,7 +1205,7 @@ async function runLoopBody(
 				const calledOnlyRequiredTool =
 					softRequiredTool !== undefined &&
 					toolCalls.length > 0 &&
-					toolCalls.every(toolCall => toolCall.name === softRequiredTool);
+					toolCalls.every(toolCall => softSatisfies?.(toolCall) ?? toolCall.name === softRequiredTool);
 				const softGateActive =
 					softRequiredTool !== undefined && !hardToolChoiceBlocks(config.toolChoice, softRequiredTool);
 				const softNonCompliant = softGateActive && !calledOnlyRequiredTool;
@@ -1082,6 +1278,12 @@ async function runLoopBody(
 					if (message.stopReason === "length" && toolResults.length > 0 && !deadlinePassed) {
 						hasMoreToolCalls = true;
 					}
+				}
+
+				// A tool hook may mark its completed result as terminal (e.g. subagent yield).
+				// Stop before the next provider call without changing external/user abort semantics.
+				if (signal?.reason === TERMINAL_TOOL_RESULT_ABORT_REASON) {
+					hasMoreToolCalls = false;
 				}
 
 				if (toolCalls.length > 0) {
@@ -1501,6 +1703,7 @@ async function streamAssistantResponse(
 						case "text_start":
 						case "text_delta":
 						case "text_end":
+						case "image_end":
 						case "thinking_start":
 						case "thinking_delta":
 						case "thinking_end":
@@ -1602,13 +1805,26 @@ function recoverTransientErrorToolTurn(
 	if (message.stopReason !== "error") return message;
 	const toolCalls = message.content.filter(block => block.type === "toolCall");
 	if (toolCalls.length === 0) return message;
+	const stopDetailType = message.stopDetails?.type;
+	const stopDetailCategory = message.stopDetails?.category;
+	if (
+		stopDetailType === "refusal" ||
+		stopDetailType === "sensitive" ||
+		stopDetailCategory === "refusal" ||
+		stopDetailCategory === "sensitive"
+	)
+		return message;
 	const availableToolNames = new Set<string>();
 	for (const tool of availableTools) {
 		availableToolNames.add(tool.name);
 		if (tool.customWireName !== undefined) availableToolNames.add(tool.customWireName);
 	}
 	if (!toolCalls.every(toolCall => availableToolNames.has(toolCall.name))) return message;
-	if (!AIError.isStreamReadErrorText(`${message.errorMessage ?? ""}\n${message.stopDetails?.explanation ?? ""}`))
+	if (
+		!AIError.isStreamReadErrorText(`${message.errorMessage ?? ""}\n${message.stopDetails?.explanation ?? ""}`) &&
+		!AIError.isTransientStreamParseError(message.errorMessage) &&
+		!AIError.isTransientStreamParseError(message.stopDetails?.explanation)
+	)
 		return message;
 	return {
 		...message,
@@ -1759,6 +1975,7 @@ async function executeToolCalls(
 		interruptMode = "immediate",
 		getToolContext,
 		transformToolCallArguments,
+		resolveFallbackTool,
 		intentTracing,
 		beforeToolCall,
 		afterToolCall,
@@ -1777,17 +1994,22 @@ async function executeToolCalls(
 	const shouldInterruptImmediately = interruptMode !== "wait";
 	const steeringAbortController = new AbortController();
 	const ircAbortController = new AbortController();
-	// Interruptible tools observe steering + external + IRC aborts; every other
-	// tool only sees steering + external, so an IRC-only interrupt never kills a
-	// partially side-effecting foreground tool (e.g. `bash`) running alongside a
-	// pure wait (e.g. `job` poll).
-	const nonInterruptibleSignal: AbortSignal = signal
-		? AbortSignal.any([signal, steeringAbortController.signal])
-		: steeringAbortController.signal;
+	// Cooperative channel: aborted when queued steering (or an interrupting
+	// peer IRC) is detected mid-batch. Tools receive it via tool context
+	// (`ctx.steeringSignal`) and MAY react — e.g. an auto-backgroundable bash
+	// backgrounds itself so the message injects promptly — but it never kills
+	// anything; ignoring it is always safe.
+	const steeringSoftController = new AbortController();
+	// Interruptible tools (pure waits: hub wait, vibe) observe steering +
+	// external + IRC aborts. Every other tool sees ONLY the external signal:
+	// neither queued steering nor a peer IRC ever hard-kills a partially
+	// side-effecting foreground tool (e.g. `bash`) — those get the cooperative
+	// steeringSignal above, and the message injects at the next boundary.
+	const nonInterruptibleSignal: AbortSignal = signal ?? new AbortController().signal;
 	const interruptibleSignal: AbortSignal = signal
 		? AbortSignal.any([signal, steeringAbortController.signal, ircAbortController.signal])
 		: AbortSignal.any([steeringAbortController.signal, ircAbortController.signal]);
-	const interruptState = { triggered: false };
+	const interruptState: { triggered: boolean; source?: SteeringInterruptSource | "irc" } = { triggered: false };
 
 	const records = toolCalls.map(toolCall => {
 		// Tools emitted via OpenAI's custom-tool path (e.g. `apply_patch` on GPT-5)
@@ -1796,12 +2018,29 @@ async function executeToolCalls(
 		// determinism if both somehow collide.
 		const tool =
 			tools?.find(t => t.name === toolCall.name) ??
-			tools?.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name);
+			tools?.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name) ??
+			// Not in the advertised set: let the host route side-transport tools
+			// (e.g. xd:// device mounts) called by their top-level name.
+			resolveFallbackTool?.(toolCall.name);
+		const args = toolCall.arguments as Record<string, unknown>;
+		const interruptibleMode = tool?.interruptible;
+		let interruptible = false;
+		if (typeof interruptibleMode === "function") {
+			try {
+				interruptible = interruptibleMode(args);
+			} catch {
+				// Resolver failures default to preserving the tool's outcome.
+				interruptible = false;
+			}
+		} else {
+			interruptible = interruptibleMode === true;
+		}
 		return {
 			toolCall,
 			tool,
-			args: toolCall.arguments as Record<string, unknown>,
-			signal: tool?.interruptible ? interruptibleSignal : nonInterruptibleSignal,
+			args,
+			interruptible,
+			signal: interruptible ? interruptibleSignal : nonInterruptibleSignal,
 			started: false,
 			result: undefined as AgentToolResult<any> | undefined,
 			isError: false,
@@ -1822,16 +2061,29 @@ async function executeToolCalls(
 		// integration only provides getSteeringMessages(), the queue drains at the
 		// injection boundary below; polling it here would strand or drop messages.
 		let steeringQueued = false;
+		let steeringSource: SteeringInterruptSource | undefined;
 		if (hasSteeringMessages) {
-			steeringQueued = await hasSteeringMessages();
+			const queuedState = await hasSteeringMessages();
+			if (typeof queuedState === "boolean") {
+				steeringQueued = queuedState;
+				steeringSource = queuedState ? "user" : undefined;
+			} else {
+				const state: SteeringQueueState = queuedState;
+				steeringQueued = state.queued;
+				steeringSource = state.source ?? (state.queued ? "unknown" : undefined);
+			}
 		}
 		if (steeringQueued) {
-			// User steering upgrades an in-flight IRC interrupt: it aborts the
-			// shared signal so foreground tools stop as they do for a user Esc.
+			// Queued steering hard-aborts only interruptible waits and raises the
+			// cooperative soft signal for everything else: the boundary dequeue
+			// below injects the message as soon as running tools finish (or
+			// background themselves), and not-yet-started tools are skipped.
 			// Idempotent — a second steer poll after the abort is a no-op.
 			if (!steeringAbortController.signal.aborted) {
 				interruptState.triggered = true;
+				interruptState.source = steeringSource ?? "unknown";
 				steeringAbortController.abort();
+				steeringSoftController.abort();
 			}
 			return;
 		}
@@ -1839,10 +2091,13 @@ async function executeToolCalls(
 		// must not re-abort, and (unlike steering above) never re-consume a queue.
 		if (interruptState.triggered) return;
 		if (hasIrcInterrupts && (await hasIrcInterrupts())) {
-			// Peer IRC only aborts interruptible waits: a foreground bash / write
-			// mid-execution keeps running so we never leave partial side effects.
+			// Peer IRC hard-aborts interruptible waits only; foreground tools keep
+			// running (no partial side effects) but get the cooperative soft
+			// signal so backgroundable work can step aside for the peer message.
 			interruptState.triggered = true;
+			interruptState.source = "irc";
 			ircAbortController.abort();
+			steeringSoftController.abort();
 		}
 	};
 
@@ -1872,6 +2127,7 @@ async function executeToolCalls(
 			toolName: toolCall.name,
 			content: result.content,
 			details: result.details,
+			providerMetadata: result.providerMetadata,
 			isError,
 			...(result.useless && !isError ? { useless: true } : {}),
 			timestamp: Date.now(),
@@ -1896,6 +2152,10 @@ async function executeToolCalls(
 			record.skipped = true;
 			return;
 		}
+		// Park before starting this tool while the process-wide pause gate is
+		// engaged. Tools already executing are unaffected (pausing never aborts);
+		// a batch interrupted mid-pause unwinds via the signal checks below.
+		if (agentPauseGate.paused) await agentPauseGate.waitUntilResumed(record.signal);
 
 		const { toolCall, tool } = record;
 		let argsForExecution = toolCall.arguments as Record<string, unknown>;
@@ -2021,12 +2281,18 @@ async function executeToolCalls(
 					: effectiveArgs;
 				record.args = executionArgs;
 
+				// The cooperative steering signal rides the loop-owned
+				// ToolCallContext (surfacing as `ctx.toolCall.steeringSignal`):
+				// AgentToolContext itself is app-built via declaration merging, so
+				// the loop cannot construct or extend one structurally.
 				const toolContext = getToolContext
 					? getToolContext({
 							batchId,
 							index,
 							total: toolCalls.length,
 							toolCalls: toolCallInfos,
+							steeringSignal: steeringSoftController.signal,
+							providerMetadata: toolCall.providerMetadata,
 						})
 					: undefined;
 				const rawResult = await tool.execute(
@@ -2079,6 +2345,7 @@ async function executeToolCalls(
 							content: after.content ?? result.content,
 							details: after.details ?? result.details,
 							isError: after.isError ?? result.isError,
+							providerMetadata: after.providerMetadata ?? result.providerMetadata,
 							useless: after.useless ?? result.useless,
 						});
 						result = coerced.result;
@@ -2097,19 +2364,21 @@ async function executeToolCalls(
 
 		const interrupted = interruptState.triggered;
 		const perToolAborted = record.signal.aborted;
-		const abortedDuringExecution = perToolAborted && isError;
-		if (interrupted && perToolAborted && isError) {
-			// This tool's own signal fired AND it failed — it was cut off before producing
-			// a usable result, so report it as skipped.
+		const abortedDuringExecution = perToolAborted && isError && !completedToolExecution;
+		if (interrupted && perToolAborted && isError && !completedToolExecution) {
+			// This tool's own signal fired AND it failed to produce a result: `tool.execute()`
+			// never returned (it threw on the abort), so it was genuinely cut off before
+			// producing usable output. Report it as skipped.
 			record.skipped = true;
-			emitToolResult(record, createSkippedToolResult(), true);
+			emitToolResult(record, createSkippedToolResult(interruptState.source), true);
 		} else {
-			// No interrupt on this signal, or the tool finished (successfully or with a
-			// genuine error) before the interrupt landed. Keep its real result: a completed
-			// tool already ran its side effects, so the model must see what actually
-			// happened rather than a false "skipped". A peer-IRC interrupt on the batch
-			// leaves non-interruptible tools' signals untouched — their genuine errors
-			// survive here instead of being clobbered into "skipped".
+			// No interrupt on this signal, or the tool finished before the interrupt landed
+			// (`completedToolExecution`) — even if the signal aborted around completion. Keep
+			// its real result: a completed tool already ran its side effects, so the model must
+			// see what actually happened (a genuine non-zero exit / error result) rather than a
+			// false "skipped" that discards work the tool performed (#4752). A peer-IRC interrupt
+			// on the batch leaves non-interruptible tools' signals untouched — their genuine
+			// errors survive here too.
 			emitToolResult(record, result, isError);
 		}
 
@@ -2166,16 +2435,14 @@ async function executeToolCalls(
 		}
 	}
 
-	// While an interruptible tool is in flight (e.g. a `job`/`irc` wait
-	// blocking on external work), queued steering or interrupting IRC would
-	// otherwise wait out the tool's own window. Poll only non-consuming queues
-	// and abort the shared tool signal so the boundary dequeue below injects
-	// the message promptly. Gated on immediate-interrupt mode + an
-	// interruptible tool; checkSteering is idempotent (no-op once triggered).
+	// While tool calls are in flight, queued steering or interrupting IRC would
+	// otherwise wait out the tools' own window. Poll only non-consuming queues:
+	// detection hard-aborts interruptible waits, soft-signals cooperative tools
+	// (auto-background bash), and skips not-yet-started tools, so the boundary
+	// dequeue below injects the message promptly. Gated on immediate-interrupt
+	// mode; checkSteering is idempotent (no-op once triggered).
 	const watchSteeringWhileRunning =
-		shouldInterruptImmediately &&
-		(hasSteeringMessages !== undefined || hasIrcInterrupts !== undefined) &&
-		records.some(r => r.tool?.interruptible === true);
+		shouldInterruptImmediately && (hasSteeringMessages !== undefined || hasIrcInterrupts !== undefined);
 	const steeringWatchTimer = watchSteeringWhileRunning
 		? setInterval(() => void checkSteering(), STEERING_INTERRUPT_POLL_MS)
 		: undefined;
@@ -2196,7 +2463,7 @@ async function executeToolCalls(
 				toolName: record.toolCall.name,
 				status: "skipped",
 			});
-			emitToolResult(record, createSkippedToolResult(), true);
+			emitToolResult(record, createSkippedToolResult(interruptState.source), true);
 		}
 	}
 
@@ -2227,6 +2494,23 @@ export interface SyntheticToolResultDetails {
 	upstreamError?: string;
 }
 
+/**
+ * Narrow an {@link AgentMessage} to a synthetic {@link ToolResultMessage} —
+ * a tool_result emitted for a tool call the assistant never invoked (see
+ * {@link SyntheticToolResultDetails}). Consumers use this to look past the
+ * placeholder pairing back to the assistant turn that produced it, e.g.
+ * `AgentSession.retry()` walking back over the synthetic results a
+ * stalled/aborted mid-tool-call turn leaves behind.
+ */
+export function isSyntheticToolResultMessage(
+	message: AgentMessage | undefined,
+): message is ToolResultMessage<SyntheticToolResultDetails> {
+	return (
+		message?.role === "toolResult" &&
+		(message.details as SyntheticToolResultDetails | undefined)?.__synthetic === true
+	);
+}
+
 function syntheticDetailsFor(
 	reason: "aborted" | "error" | "skipped" | "length",
 	errorMessage: string | undefined,
@@ -2248,18 +2532,14 @@ function syntheticDetailsFor(
 }
 
 /**
- * Create a tool result for a tool call that was emitted by the assistant but
- * never invoked locally. Maintains the tool_use / tool_result pairing the
- * provider API requires, and tags {@link SyntheticToolResultDetails} so
- * consumers can distinguish this from a real local tool failure without
- * string-matching the content (#4321).
+ * Create the persisted synthetic result for a tool call that was emitted by
+ * the assistant but never invoked locally.
  */
-function createAbortedToolResult(
+export function createSyntheticToolResultMessage(
 	toolCall: Extract<AssistantMessage["content"][number], { type: "toolCall" }>,
-	stream: EventStream<AgentEvent, AgentMessage[]>,
 	reason: "aborted" | "error" | "skipped" | "length",
 	errorMessage?: string,
-): ToolResultMessage {
+): ToolResultMessage<SyntheticToolResultDetails> {
 	const message =
 		reason === "aborted"
 			? "Tool execution was aborted"
@@ -2269,9 +2549,31 @@ function createAbortedToolResult(
 					? "Tool call was not executed because the assistant ended its turn"
 					: "Tool call was not executed because the provider stream ended with an error before the tool could run";
 	const details = syntheticDetailsFor(reason, errorMessage);
-	const result: AgentToolResult<SyntheticToolResultDetails> = {
+	return {
+		role: "toolResult",
+		toolCallId: toolCall.id,
+		toolName: toolCall.name,
 		content: [{ type: "text", text: errorMessage ? `${message}: ${errorMessage}` : `${message}.` }],
 		details,
+		isError: true,
+		timestamp: Date.now(),
+	};
+}
+
+/**
+ * Create and emit a tool result for a tool call that was emitted by the
+ * assistant but never invoked locally.
+ */
+function createAbortedToolResult(
+	toolCall: Extract<AssistantMessage["content"][number], { type: "toolCall" }>,
+	stream: EventStream<AgentEvent, AgentMessage[]>,
+	reason: "aborted" | "error" | "skipped" | "length",
+	errorMessage?: string,
+): ToolResultMessage {
+	const toolResultMessage = createSyntheticToolResultMessage(toolCall, reason, errorMessage);
+	const result: AgentToolResult<SyntheticToolResultDetails> = {
+		content: toolResultMessage.content,
+		details: toolResultMessage.details,
 	};
 
 	stream.push({
@@ -2288,17 +2590,6 @@ function createAbortedToolResult(
 		result,
 		isError: true,
 	});
-
-	const toolResultMessage: ToolResultMessage<SyntheticToolResultDetails> = {
-		role: "toolResult",
-		toolCallId: toolCall.id,
-		toolName: toolCall.name,
-		content: result.content,
-		details,
-		isError: true,
-		timestamp: Date.now(),
-	};
-
 	stream.push({ type: "message_start", message: toolResultMessage });
 	stream.push({ type: "message_end", message: toolResultMessage });
 
@@ -2313,12 +2604,24 @@ function createToolSignalAbortedResult(signal: AbortSignal): AgentToolResult<unk
 	};
 }
 
-function createSkippedToolResult(): AgentToolResult<any> {
+function createSkippedToolResult(source: SteeringInterruptSource | "irc" | undefined): AgentToolResult<any> {
+	let reason = "pending steering message";
+	let blocker = "queued message";
+	if (source === "user") {
+		reason = "queued user message";
+		blocker = "queued message";
+	} else if (source === "system") {
+		reason = "pending system advisory";
+		blocker = "advisory";
+	} else if (source === "irc") {
+		reason = "pending peer interrupt";
+		blocker = "interrupt";
+	}
 	return {
 		content: [
 			{
 				type: "text",
-				text: "Skipped due to queued user message. Do not count this skipped result as completed work or verification. After the queued message is handled on the next step, retry the skipped tool if it is still needed.",
+				text: `Skipped due to ${reason}. Do not count this skipped result as completed work or verification. After the ${blocker} is handled on the next step, retry the skipped tool if it is still needed.`,
 			},
 		],
 		details: {},

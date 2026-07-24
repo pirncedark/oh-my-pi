@@ -11,7 +11,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import type { SourceMeta } from "../capability/types";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import type { CustomTool } from "../extensibility/custom-tools/types";
-import type { AuthStorage } from "../session/auth-storage";
+import { type AuthStorage, REMOTE_REFRESH_SENTINEL } from "../session/auth-storage";
 import {
 	connectToServer,
 	disconnectServer,
@@ -38,6 +38,7 @@ import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
 import type {
+	MCPAuthChallenge,
 	MCPGetPromptResult,
 	MCPPrompt,
 	MCPRequestOptions,
@@ -160,6 +161,9 @@ export interface MCPDiscoverOptions {
 	onStatus?: (event: McpConnectionStatusEvent) => void;
 }
 
+/** Handles an MCP `WWW-Authenticate` challenge and returns refreshed config. */
+export type MCPAuthHandler = (serverName: string, challenge: MCPAuthChallenge) => Promise<MCPServerConfig | undefined>;
+
 /**
  * MCP Server Manager.
  *
@@ -189,6 +193,7 @@ export class MCPManager {
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
 	#sources = new Map<string, SourceMeta>();
 	#authStorage: AuthStorage | null = null;
+	#authHandler?: MCPAuthHandler;
 	#onNotification?: (serverName: string, method: string, params: unknown) => void;
 	#onToolsChanged?: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void;
 	#onResourcesChanged?: (serverName: string, uri: string) => void;
@@ -201,7 +206,7 @@ export class MCPManager {
 	/** Preserved configs for reconnection after connection loss. */
 	#serverConfigs = new Map<string, MCPServerConfig>();
 	/**
-	 * Timestamps of recent `reconnectServer` invocations per server, used by the
+	 * Timestamps of recent reconnectServer invocations per server, used by the
 	 * crash-storm circuit breaker (see {@link RECONNECT_BURST_LIMIT}).
 	 */
 	#reconnectHistory = new Map<string, number[]>();
@@ -310,6 +315,11 @@ export class MCPManager {
 	 */
 	setAuthStorage(authStorage: AuthStorage): void {
 		this.#authStorage = authStorage;
+	}
+
+	/** Set the callback used to complete OAuth after a tool-level auth challenge. */
+	setAuthHandler(handler: MCPAuthHandler | undefined): void {
+		this.#authHandler = handler;
 	}
 
 	/**
@@ -474,7 +484,8 @@ export class MCPManager {
 				.then(async ({ connection, serverTools }) => {
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
-					const reconnect = () => this.reconnectServer(name);
+					const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) =>
+						this.reconnectServer(name, options);
 					const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 					this.#replaceServerTools(name, customTools);
 					this.#onToolsChanged?.(this.#tools);
@@ -572,8 +583,14 @@ export class MCPManager {
 		};
 	}
 
+	/**
+	 * Ownership is matched via `mcpServerName`, never a `mcp__${name}_` name
+	 * prefix: tool names are lossy-sanitized, so one server's sanitized name
+	 * can prefix another's (`atlassian` vs `atlassian:atlassian`) and a name
+	 * with sanitized characters never prefix-matches its own tools at all.
+	 */
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
-		this.#tools = this.#tools.filter(t => !t.name.startsWith(`mcp__${name}_`));
+		this.#tools = this.#tools.filter(t => t.mcpServerName !== name);
 		this.#tools.push(...tools);
 		// Stable sort by name so reconnect order does not perturb the array.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
@@ -762,8 +779,8 @@ export class MCPManager {
 		}
 
 		// Remove tools from this server and notify consumers
-		const hadTools = this.#tools.some(t => t.name.startsWith(`mcp__${name}_`));
-		this.#tools = this.#tools.filter(t => !t.name.startsWith(`mcp__${name}_`));
+		const hadTools = this.#tools.some(t => t.mcpServerName === name);
+		this.#tools = this.#tools.filter(t => t.mcpServerName !== name);
 		if (hadTools) this.#onToolsChanged?.(this.#tools);
 
 		// Notify prompt consumers so stale commands are cleared
@@ -804,13 +821,15 @@ export class MCPManager {
 	 * the same server share one reconnection attempt. Returns the new
 	 * connection, or `null` if reconnection failed or the per-server crash
 	 * burst limit (see {@link RECONNECT_BURST_LIMIT}) is exceeded.
-	 *
 	 * @param options.manual - When `true`, resets the crash-burst window so a
 	 *   user-driven retry (e.g. `/mcp reconnect`) is never blocked by an
 	 *   earlier storm. Defaults to `false`; the transport `onClose` callback
 	 *   and the per-tool-call retry path in `tool-bridge` MUST NOT set it.
 	 */
-	async reconnectServer(name: string, options?: { manual?: boolean }): Promise<MCPServerConnection | null> {
+	async reconnectServer(
+		name: string,
+		options?: { manual?: boolean; authChallenge?: MCPAuthChallenge },
+	): Promise<MCPServerConnection | null> {
 		if (options?.manual) {
 			this.#reconnectHistory.delete(name);
 		}
@@ -822,7 +841,7 @@ export class MCPManager {
 			return null;
 		}
 
-		const attempt = this.#doReconnect(name);
+		const attempt = this.#doReconnect(name, options?.authChallenge);
 		this.#pendingReconnections.set(name, attempt);
 		return attempt.finally(() => this.#pendingReconnections.delete(name));
 	}
@@ -867,11 +886,29 @@ export class MCPManager {
 		return false;
 	}
 
-	async #doReconnect(name: string): Promise<MCPServerConnection | null> {
+	async #doReconnect(name: string, authChallenge?: MCPAuthChallenge): Promise<MCPServerConnection | null> {
 		const oldConnection = this.#connections.get(name);
-		const config = oldConnection?.config ?? this.#serverConfigs.get(name);
+		let config = oldConnection?.config ?? this.#serverConfigs.get(name);
 		const source = this.#sources.get(name) ?? oldConnection?._source;
 		if (!config) return null;
+
+		if (authChallenge) {
+			if (!this.#authHandler) {
+				logger.error("MCP auth challenge cannot be handled; no auth handler is configured", {
+					path: `mcp:${name}`,
+				});
+				return null;
+			}
+			try {
+				const refreshedConfig = await this.#authHandler(name, authChallenge);
+				if (!refreshedConfig) return null;
+				config = refreshedConfig;
+				this.#serverConfigs.set(name, config);
+			} catch (error) {
+				logger.error("MCP auth challenge handling failed", { path: `mcp:${name}`, error });
+				return null;
+			}
+		}
 
 		logger.debug("MCP reconnecting", { path: `mcp:${name}` });
 
@@ -981,7 +1018,7 @@ export class MCPManager {
 		};
 		try {
 			const serverTools = await listTools(connection);
-			const reconnect = () => this.reconnectServer(name);
+			const reconnect = (options?: { authChallenge?: MCPAuthChallenge }) => this.reconnectServer(name, options);
 			const customTools = MCPTool.fromTools(connection, serverTools, reconnect);
 			void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
@@ -1226,76 +1263,79 @@ export class MCPManager {
 			const { credentialId } = lookup;
 			try {
 				let credential: MCPStoredOAuthCredential | undefined = lookup.credential;
-				// Refresh material comes from ONE source: the credential's embedded
-				// fields (written atomically with the tokens they minted — tokenUrl
-				// always present) or, for legacy rows that predate embedding, the
-				// config auth block. Never mix the two: a shared file's auth block
-				// can belong to another profile, whose client the grant is NOT
-				// bound to.
-				const material = selectMcpOAuthRefreshMaterial(credential, auth);
-				const tokenUrl = material?.tokenUrl;
-				const clientId = material?.clientId;
-				const clientSecret = material?.clientSecret;
-				// `authorizationUrl` only lives on the embedded credential form;
-				// legacy `MCPAuthConfig` rows never carried it. Required to filter
-				// same-origin resource indicators on refresh when the authorize and
-				// token endpoints sit on different origins (issue #3502 review
-				// follow-up).
-				const authorizationUrl = material && "authorizationUrl" in material ? material.authorizationUrl : undefined;
-				const resourceIsFallback =
-					!material?.resource && (config.type === "http" || config.type === "sse") && Boolean(config.url);
-				const resource = material?.resource ?? (resourceIsFallback ? config.url : undefined);
-				// Proactive refresh: 5-minute buffer before expiry
-				// Force refresh: on 401/403 auth errors (revoked tokens, clock skew, missing expires)
 				const REFRESH_BUFFER_MS = 5 * 60_000;
-				const shouldRefresh =
-					opts?.forceRefresh || (credential.expires && Date.now() >= credential.expires - REFRESH_BUFFER_MS);
-				if (shouldRefresh && credential.refresh && tokenUrl) {
-					try {
-						const refreshed = await refreshMCPOAuthToken(
-							tokenUrl,
-							credential.refresh,
-							clientId,
-							clientSecret,
-							resource,
-							{ authorizationUrl, stripSameOriginResource: resourceIsFallback },
-						);
-						// Spread the old credential first so embedded refresh material survives rotation.
-						const refreshedCredential: MCPStoredOAuthCredential = {
-							...credential,
-							...refreshed,
-							tokenUrl,
-							clientId,
-							clientSecret,
-							resource: resourceIsFallback ? undefined : resource,
-							authorizationUrl,
-						};
-						await this.#authStorage.set(credentialId, refreshedCredential);
-						credential = refreshedCredential;
-					} catch (refreshError) {
-						const errorMsg = refreshError instanceof Error ? refreshError.message : String(refreshError);
-						if (isDefinitiveOAuthFailure(errorMsg)) {
-							// `invalid_grant` / `invalid_token` / 401 from the token endpoint means
-							// the server has retired this credential — keeping the stale access
-							// token would just re-fail with 401 on every MCP request and leave a
-							// poisoned row in agent.db that survives restarts. Drop it now so the
-							// next connect attempt surfaces a clean "needs reauth" failure and
-							// the user can recover with `/mcp reauth <server>` (or `/mcp unauth`
-							// to forget the server entirely).
-							logger.warn("MCP OAuth refresh failed definitively; cleared credential", {
-								credentialId,
-								error: errorMsg,
+				const refreshResult = await this.#authStorage.refreshStoredOAuthCredential<MCPStoredOAuthCredential>(
+					credentialId,
+					{
+						observedCredential: credential,
+						credentialFromRow: row => row,
+						forceRefresh: opts?.forceRefresh,
+						refreshSkewMs: REFRESH_BUFFER_MS,
+						canRefresh: current => {
+							const material = selectMcpOAuthRefreshMaterial(current, auth);
+							return Boolean(current.refresh && material?.tokenUrl);
+						},
+						refresh: (current, signal) => {
+							if (current.refresh === REMOTE_REFRESH_SENTINEL) {
+								throw new Error("MCP OAuth refresh token is broker-redacted; local refresh is unavailable");
+							}
+							const material = selectMcpOAuthRefreshMaterial(current, auth);
+							const tokenUrl = material?.tokenUrl;
+							if (!current.refresh || !tokenUrl) {
+								throw new Error("MCP OAuth credential is missing refresh material");
+							}
+							const clientId = material?.clientId;
+							const clientSecret = material?.clientSecret;
+							const authorizationUrl =
+								material && "authorizationUrl" in material ? material.authorizationUrl : undefined;
+							const resourceIsFallback =
+								!material?.resource && (config.type === "http" || config.type === "sse") && Boolean(config.url);
+							const resource = material?.resource ?? (resourceIsFallback ? config.url : undefined);
+							return refreshMCPOAuthToken(tokenUrl, current.refresh, clientId, clientSecret, resource, {
+								authorizationUrl,
+								stripSameOriginResource: resourceIsFallback,
+								signal,
 							});
-							await this.#authStorage.remove(credentialId);
-							credential = undefined;
-						} else {
+						},
+						mergeRefreshedCredential: (current, refreshed) => {
+							const material = selectMcpOAuthRefreshMaterial(current, auth);
+							const tokenUrl = material?.tokenUrl;
+							const clientId = material?.clientId;
+							const clientSecret = material?.clientSecret;
+							const authorizationUrl =
+								material && "authorizationUrl" in material ? material.authorizationUrl : undefined;
+							const resourceIsFallback =
+								!material?.resource && (config.type === "http" || config.type === "sse") && Boolean(config.url);
+							const resource = material?.resource ?? (resourceIsFallback ? config.url : undefined);
+							return {
+								...current,
+								...refreshed,
+								tokenUrl,
+								clientId,
+								clientSecret,
+								resource: resourceIsFallback ? undefined : resource,
+								authorizationUrl,
+							};
+						},
+						isDefinitiveFailure: error =>
+							isDefinitiveOAuthFailure(error instanceof Error ? error.message : String(error)),
+						disabledCause: error =>
+							`oauth refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+						keepCredentialOnRefreshFailure: error =>
+							!(error instanceof Error && error.message.includes("broker-redacted")),
+						onRefreshFailure: refreshError => {
+							if (refreshError instanceof Error && refreshError.message.includes("broker-redacted")) return;
 							logger.warn("MCP OAuth refresh failed, using existing token", {
 								credentialId,
 								error: refreshError,
 							});
-						}
-					}
+						},
+					},
+				);
+				if (refreshResult.removed) {
+					logger.warn("MCP OAuth refresh failed definitively; cleared credential", { credentialId });
 				}
+				credential = refreshResult.credential;
 
 				if (credential) {
 					if (resolved.type === "http" || resolved.type === "sse") {

@@ -83,46 +83,6 @@ describe("readToolRenderer hyperlinks", () => {
 		expect(extractLinkTexts(rendered)).not.toContain(`${examplePath}:10-12`);
 	});
 
-	it("renders separate selector read call paths while linking only the base path", async () => {
-		settings.override("tui.hyperlinks", "always");
-		const theme = await getThemeByName("dark");
-		expect(theme).toBeDefined();
-
-		const examplePath = path.resolve("/tmp/omp-read/separate-selector.ts");
-		const component = readToolRenderer.renderCall(
-			{ path: examplePath, selector: "10-12" },
-			{ expanded: false, isPartial: false },
-			theme!,
-		);
-
-		const rendered = component.render(200).join("\n");
-		expect(Bun.stripANSI(rendered)).toContain(`${examplePath}:10-12`);
-		const exampleUri = new URL(url.pathToFileURL(path.resolve(examplePath)).href);
-		exampleUri.searchParams.set("line", "10");
-		expect(extractLinkUris(rendered)).toContain(exampleUri.href);
-		expect(extractLinkTexts(rendered)).toContain(examplePath);
-		expect(extractLinkTexts(rendered)).not.toContain(`${examplePath}:10-12`);
-	});
-
-	it("renders separate raw read selectors while linking only the base path", async () => {
-		settings.override("tui.hyperlinks", "always");
-		const theme = await getThemeByName("dark");
-		expect(theme).toBeDefined();
-
-		const examplePath = path.resolve("/tmp/omp-read/raw-selector.ts");
-		const component = readToolRenderer.renderCall(
-			{ path: examplePath, selector: "raw" },
-			{ expanded: false, isPartial: false },
-			theme!,
-		);
-
-		const rendered = component.render(200).join("\n");
-		expect(Bun.stripANSI(rendered)).toContain(`${examplePath}:raw`);
-		expect(extractLinkUris(rendered)).toContain(url.pathToFileURL(path.resolve(examplePath)).href);
-		expect(extractLinkTexts(rendered)).toContain(examplePath);
-		expect(extractLinkTexts(rendered)).not.toContain(`${examplePath}:raw`);
-	});
-
 	it("links HTTP read result headers to the final URL", async () => {
 		settings.override("tui.hyperlinks", "always");
 		const theme = await getThemeByName("dark");
@@ -149,6 +109,84 @@ describe("readToolRenderer hyperlinks", () => {
 		const rendered = component.render(200).join("\n");
 		expect(rendered).toContain("example.com /final");
 		expect(extractLinkUris(rendered)).toContain("http://example.com/final");
+	});
+});
+
+describe("readToolRenderer markdown content", () => {
+	it("renders text/markdown details through the markdown renderer", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+
+		const component = readToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "[notes.md#ABCD]\n1:# Heading\n2:\n3:This is **bold** text." }],
+				details: {
+					displayContent: { text: "# Heading\n\nThis is **bold** text.", startLine: 1 },
+					contentType: "text/markdown",
+				},
+			},
+			{ expanded: true, isPartial: false },
+			theme!,
+			{ path: "notes.md" },
+		);
+
+		const stripped = component
+			.render(100)
+			.map(line => Bun.stripANSI(line))
+			.join("\n");
+		expect(stripped).toContain("Heading");
+		expect(stripped).toContain("This is bold text.");
+		expect(stripped).not.toContain("# Heading");
+		expect(stripped).not.toContain("**bold**");
+	});
+
+	it("keeps untagged markdown source in the code renderer", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+
+		const component = readToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "[notes.md#ABCD]\n1:# Heading\n2:\n3:This is **bold** text." }],
+				details: {
+					displayContent: { text: "# Heading\n\nThis is **bold** text.", startLine: 1 },
+				},
+			},
+			{ expanded: true, isPartial: false },
+			theme!,
+			{ path: "notes.md" },
+		);
+
+		const stripped = component
+			.render(100)
+			.map(line => Bun.stripANSI(line))
+			.join("\n");
+		expect(stripped).toContain("# Heading");
+		expect(stripped).toContain("**bold**");
+	});
+
+	it("keeps raw markdown selector reads in the code renderer", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+
+		const component = readToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "# Heading\n\nThis is **bold** text." }],
+				details: {
+					displayContent: { text: "# Heading\n\nThis is **bold** text.", startLine: 1 },
+					contentType: "text/markdown",
+				},
+			},
+			{ expanded: true, isPartial: false },
+			theme!,
+			{ path: "notes.md:raw" },
+		);
+
+		const stripped = component
+			.render(100)
+			.map(line => Bun.stripANSI(line))
+			.join("\n");
+		expect(stripped).toContain("# Heading");
+		expect(stripped).toContain("**bold**");
 	});
 });
 

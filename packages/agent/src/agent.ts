@@ -31,6 +31,7 @@ import {
 	abortReasonText,
 	agentLoop,
 	agentLoopContinue,
+	createSyntheticToolResultMessage,
 	normalizeMessagesForProvider,
 	normalizeTools,
 	resolveOwnedDialectFromEnv,
@@ -64,18 +65,15 @@ function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	});
 }
 
-const ANTHROPIC_OUTPUT_BLOCKED_PREFIX = "Output blocked by conten";
-
-function isAnthropicOutputBlockedError(message: string): boolean {
-	return message.includes(ANTHROPIC_OUTPUT_BLOCKED_PREFIX);
-}
-
 function refreshToolChoiceForActiveTools(
 	toolChoice: ToolChoice | undefined,
 	tools: AgentContext["tools"] = [],
 ): ToolChoice | undefined {
 	if (!toolChoice || typeof toolChoice === "string") {
 		return toolChoice;
+	}
+	if (toolChoice.type === "computer") {
+		return tools.some(tool => tool.native?.type === "computer") ? toolChoice : undefined;
 	}
 
 	const toolName =
@@ -243,6 +241,13 @@ export interface AgentOptions {
 	 */
 	transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
 
+	/**
+	 * Resolve a tool call whose name matched no advertised tool. Lets hosts
+	 * route calls to tools exposed through side transports (e.g. `xd://`
+	 * device mounts) instead of failing with "Tool not found".
+	 */
+	resolveFallbackTool?: (name: string) => AgentTool<any> | undefined;
+
 	/** Enable intent tracing schema injection/stripping in the harness. */
 	intentTracing?: boolean;
 	/**
@@ -267,6 +272,8 @@ export interface AgentOptions {
 	 * Cursor exec handlers for local tool execution.
 	 */
 	cursorExecHandlers?: CursorExecHandlers;
+	/** Additional tools Cursor executes through its MCP request-context bridge, resolved before each provider call. */
+	getCursorTools?: () => AgentTool[];
 
 	/**
 	 * Cursor tool result callback for exec tool responses.
@@ -368,6 +375,7 @@ export class Agent {
 	#maxRetryDelayMs?: number;
 	#getToolContext?: (toolCall?: ToolCallContext) => AgentToolContext | undefined;
 	#cursorExecHandlers?: CursorExecHandlers;
+	#getCursorTools?: () => AgentTool[];
 	#cursorOnToolResult?: CursorToolResultHandler;
 	#cwd?: string;
 	#cwdResolver?: () => string | undefined;
@@ -377,6 +385,7 @@ export class Agent {
 	#kimiApiFormat?: "openai" | "anthropic";
 	#preferWebsockets?: boolean;
 	#transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
+	#resolveFallbackTool?: (name: string) => AgentTool<any> | undefined;
 	#intentTracing: boolean;
 	#pruneToolDescriptions: boolean;
 	#dialect?: Dialect;
@@ -450,12 +459,14 @@ export class Agent {
 		this.#onSseEvent = opts.onSseEvent;
 		this.#getToolContext = opts.getToolContext;
 		this.#cursorExecHandlers = opts.cursorExecHandlers;
+		this.#getCursorTools = opts.getCursorTools;
 		this.#cursorOnToolResult = opts.cursorOnToolResult;
 		this.#cwd = opts.cwd;
 		this.#cwdResolver = opts.cwdResolver;
 		this.#kimiApiFormat = opts.kimiApiFormat;
 		this.#preferWebsockets = opts.preferWebsockets;
 		this.#transformToolCallArguments = opts.transformToolCallArguments;
+		this.#resolveFallbackTool = opts.resolveFallbackTool;
 		this.#intentTracing = opts.intentTracing === true;
 		this.#pruneToolDescriptions = opts.pruneToolDescriptions === true;
 		this.#dialect = opts.dialect;
@@ -694,6 +705,22 @@ export class Agent {
 		this.#appendOnlyContext = manager;
 	}
 
+	#toolsForModel(model: Model): AgentTool[] {
+		if (model.api !== "cursor-agent" || !this.#getCursorTools) return this.#state.tools;
+		const cursorTools = this.#getCursorTools();
+		if (cursorTools.length === 0) return this.#state.tools;
+
+		const names = new Set(this.#state.tools.map(tool => tool.name));
+		let merged: AgentTool[] | undefined;
+		for (const tool of cursorTools) {
+			if (names.has(tool.name)) continue;
+			merged ??= this.#state.tools.slice();
+			merged.push(tool);
+			names.add(tool.name);
+		}
+		return merged ?? this.#state.tools;
+	}
+
 	/**
 	 * Assemble the provider Context for a side-channel (no-loop) request, mirroring
 	 * the main loop's prefix (system + normalized tools) so it shares the prompt
@@ -718,7 +745,7 @@ export class Agent {
 		const tools = ownedDialect
 			? []
 			: (normalizeTools(
-					this.#state.tools,
+					this.#toolsForModel(model),
 					this.#intentTracing,
 					preferredDialect(model.id),
 					this.#pruneToolDescriptions,
@@ -1032,6 +1059,22 @@ export class Agent {
 
 		const messages = this.#state.messages;
 		if (messages.length === 0) {
+			// An empty transcript has nothing to resume, but a queued steer/follow-up
+			// must still be delivered as the opening turn — mirroring the assistant-tail
+			// branch below. Throwing here leaves the message undeliverable, and idle-drain
+			// callers (AgentSession#scheduleQueuedMessageDrain) re-arm continue() on every
+			// microtask because hasQueuedMessages() never clears, spinning an unbounded
+			// allocation loop until OOM (issue #6344).
+			const queuedSteering = this.#dequeueSteeringMessages();
+			if (queuedSteering.length > 0) {
+				await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true });
+				return;
+			}
+			const queuedFollowUp = this.#dequeueFollowUpMessages();
+			if (queuedFollowUp.length > 0) {
+				await this.#runLoop(queuedFollowUp);
+				return;
+			}
 			throw new Error("No messages to continue from");
 		}
 		if (messages[messages.length - 1].role === "assistant") {
@@ -1152,13 +1195,14 @@ export class Agent {
 					await Bun.sleep(0);
 				}
 				context.systemPrompt = this.#state.systemPrompt;
-				context.tools = this.#state.tools;
+				context.tools = this.#toolsForModel(this.#state.model ?? model);
 			},
 			cursorExecHandlers: this.#cursorExecHandlers,
 			cursorOnToolResult,
 			cwd: this.#cwd,
 			getCwd: this.#cwdResolver,
 			transformToolCallArguments: this.#transformToolCallArguments,
+			resolveFallbackTool: this.#resolveFallbackTool,
 			intentTracing: this.#intentTracing,
 			pruneToolDescriptions: this.#pruneToolDescriptions,
 			dialect: this.#dialect,
@@ -1184,7 +1228,19 @@ export class Agent {
 				}
 				return this.#dequeueSteeringMessages();
 			},
-			hasSteeringMessages: () => this.#steeringQueue.length > 0,
+			hasSteeringMessages: () => {
+				if (this.#steeringQueue.length === 0) {
+					return { queued: false };
+				}
+				for (const message of this.#steeringQueue) {
+					const role = "role" in message ? message.role : undefined;
+					const attribution = "attribution" in message ? message.attribution : undefined;
+					if (role === "user" && attribution !== "agent") {
+						return { queued: true, source: "user" };
+					}
+				}
+				return { queued: true, source: "system" };
+			},
 			hasIrcInterrupts: this.hasIrcInterrupts,
 			getFollowUpMessages: async () => this.#dequeueFollowUpMessages(),
 			getAsideMessages: async () => (await this.#asideMessageProvider?.()) ?? [],
@@ -1193,6 +1249,7 @@ export class Agent {
 		};
 
 		let partial: AgentMessage | null = null;
+		const completedToolCallIds = new Set<string>();
 
 		try {
 			const stream = messages
@@ -1210,6 +1267,9 @@ export class Agent {
 					case "message_update":
 						partial = event.message;
 						this.#state.streamMessage = event.message;
+						if (event.assistantMessageEvent.type === "toolcall_end") {
+							completedToolCallIds.add(event.assistantMessageEvent.toolCall.id);
+						}
 						break;
 
 					case "message_end":
@@ -1271,12 +1331,22 @@ export class Agent {
 				: err instanceof Error
 					? err.message
 					: String(err);
-			const shouldEmitVisibleOutputBlockedError = !stoppedForAbort && isAnthropicOutputBlockedError(errorMessage);
+			const shouldEmitVisibleError = !stoppedForAbort;
 			const assistantPartial = partial?.role === "assistant" ? partial : undefined;
 			const hadAssistantStart = assistantPartial !== undefined;
+			const bufferedCursorResults = this.#cursorToolResultBuffer.map(({ toolResult }) => toolResult);
+			const retainedToolCallIds = new Set(completedToolCallIds);
+			for (const { toolCallId } of bufferedCursorResults) retainedToolCallIds.add(toolCallId);
 			const errorMsg: AssistantMessage =
-				shouldEmitVisibleOutputBlockedError && assistantPartial
-					? { ...assistantPartial, stopReason: "error", errorMessage }
+				shouldEmitVisibleError && assistantPartial
+					? {
+							...assistantPartial,
+							content: assistantPartial.content.filter(
+								block => block.type !== "toolCall" || retainedToolCallIds.has(block.id),
+							),
+							stopReason: "error",
+							errorMessage,
+						}
 					: {
 							role: "assistant",
 							content: [{ type: "text", text: "" }],
@@ -1296,7 +1366,7 @@ export class Agent {
 							timestamp: Date.now(),
 						};
 
-			if (shouldEmitVisibleOutputBlockedError) {
+			if (shouldEmitVisibleError) {
 				if (!hadAssistantStart) {
 					this.#state.streamMessage = errorMsg;
 					this.#emit({ type: "message_start", message: errorMsg });
@@ -1305,8 +1375,40 @@ export class Agent {
 				this.appendMessage(errorMsg);
 				this.#state.error = errorMessage;
 				this.#emit({ type: "message_end", message: errorMsg });
-				this.#emit({ type: "turn_end", message: errorMsg, toolResults: [] });
-				this.#emit({ type: "agent_end", messages: [errorMsg] });
+				const toolResults: ToolResultMessage[] = [];
+				this.#cursorToolResultBuffer = [];
+				const bufferedCursorToolCallIds = new Set(bufferedCursorResults.map(({ toolCallId }) => toolCallId));
+				for (const toolResult of bufferedCursorResults) {
+					this.appendMessage(toolResult);
+					this.#emit({ type: "message_start", message: toolResult });
+					this.#emit({ type: "message_end", message: toolResult });
+					toolResults.push(toolResult);
+				}
+				for (const block of errorMsg.content) {
+					if (block.type !== "toolCall") continue;
+					if (bufferedCursorToolCallIds.has(block.id)) continue;
+					const toolResult = createSyntheticToolResultMessage(block, "error", errorMessage);
+					this.#emit({
+						type: "tool_execution_start",
+						toolCallId: block.id,
+						toolName: block.name,
+						args: block.arguments,
+						intent: block.intent,
+					});
+					this.#emit({
+						type: "tool_execution_end",
+						toolCallId: block.id,
+						toolName: block.name,
+						result: { content: toolResult.content, details: toolResult.details },
+						isError: true,
+					});
+					this.appendMessage(toolResult);
+					this.#emit({ type: "message_start", message: toolResult });
+					this.#emit({ type: "message_end", message: toolResult });
+					toolResults.push(toolResult);
+				}
+				this.#emit({ type: "turn_end", message: errorMsg, toolResults });
+				this.#emit({ type: "agent_end", messages: [errorMsg, ...toolResults] });
 			} else {
 				this.appendMessage(errorMsg);
 				this.#state.error = errorMessage;

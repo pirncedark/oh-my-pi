@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [17.1.0] - 2026-07-24
+
+### Added
+
+- Added an `includeThinking` serialization option (defaulting to `true`) to allow excluding assistant reasoning (`¶think:` sections) from archived transcripts.
+
+## [16.5.0] - 2026-07-13
+
+### Changed
+
+- Updated archived transcript rendering to use a more compact format with `¶user:`, `¶think:`, `¶ai:`, and `¶call:` scopes, omitting repeated adjacent scope headers and appending tool-call intents as comments.
+
 ## [16.3.7] - 2026-07-05
 
 ### Fixed

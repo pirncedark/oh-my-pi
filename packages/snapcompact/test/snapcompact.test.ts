@@ -664,12 +664,12 @@ describe("serializeConversation", () => {
 		expect(out.length).toBeLessThan(2200);
 	});
 
-	it("renders roles as markdown headings", () => {
+	it("renders roles with compact inline headings", () => {
 		const out = snapcompact.serializeConversation([
 			createUserMessage("do the thing"),
 			createAssistantMessage([{ type: "text", text: "done" }]),
 		]);
-		expect(out).toBe("# User ¶\ndo the thing\n\n# Assistant ¶\ndone");
+		expect(out).toBe("¶user:do the thing\n\n¶ai:done");
 	});
 
 	it("merges a tool call with its paired result into one block, intent as a // comment", () => {
@@ -687,7 +687,7 @@ describe("serializeConversation", () => {
 			],
 			{ dimToolResults: false },
 		);
-		expect(out).toBe('# Tool call ¶\n//Running tests\nbash(command="bun test")\n<out>\n3 pass\n</out>');
+		expect(out).toBe('¶call:bash(command="bun test")//Running tests\n<out>\n3 pass\n</out>');
 	});
 
 	it("prefers the harness-derived intent over the raw intent arg and squashes newlines", () => {
@@ -707,29 +707,44 @@ describe("serializeConversation", () => {
 		expect(out).not.toContain(`${INTENT_FIELD}=`);
 	});
 
-	it("folds thinking into the assistant block as italics above the text", () => {
+	it("folds thinking into separate sections above the text", () => {
 		const out = snapcompact.serializeConversation([
 			createAssistantMessage([
 				{ type: "thinking", thinking: "weigh options" },
 				{ type: "text", text: "the answer" },
 			]),
 		]);
-		expect(out).toBe("# Assistant ¶\n_weigh options_\n\nthe answer");
+		expect(out).toBe("¶think:weigh options\n\n¶ai:the answer");
 	});
 
-	it("gives a thinking-only turn its own assistant heading before the tool calls", () => {
+	it("drops ¶think reasoning sections when includeThinking is false but keeps the reply", () => {
+		const out = snapcompact.serializeConversation(
+			[
+				createAssistantMessage([
+					{ type: "thinking", thinking: "private chain of thought" },
+					{ type: "text", text: "the answer" },
+				]),
+			],
+			{ includeThinking: false },
+		);
+		expect(out).not.toContain("¶think:");
+		expect(out).not.toContain("private chain of thought");
+		expect(out).toBe("¶ai:the answer");
+	});
+
+	it("gives a thinking-only turn its own heading before the tool calls", () => {
 		const out = snapcompact.serializeConversation([
 			createAssistantMessage([
 				{ type: "thinking", thinking: "plan first" },
 				{ type: "toolCall", id: "c1", name: "read", arguments: { path: "a.ts" } },
 			]),
 		]);
-		expect(out).toBe('# Assistant ¶\n_plan first_\n\n# Tool call ¶\nread(path="a.ts")');
+		expect(out).toBe('¶think:plan first\n\n¶call:read(path="a.ts")');
 	});
 
 	it("renders an orphan tool result (call outside the window) standalone", () => {
 		const out = snapcompact.serializeConversation([createToolResultMessage("ok")], { dimToolResults: false });
-		expect(out).toBe("# Tool call ¶\n<out>\nok\n</out>");
+		expect(out).toBe("¶call:\n<out>\nok\n</out>");
 	});
 
 	it("preserves content order: text before and after a tool call stay split around it", () => {
@@ -744,9 +759,7 @@ describe("serializeConversation", () => {
 			],
 			{ dimToolResults: false },
 		);
-		expect(out).toBe(
-			'# Assistant ¶\nbefore\n\n# Tool call ¶\nread(path="a.ts")\n<out>\nfile body\n</out>\n\n# Assistant ¶\nafter',
-		);
+		expect(out).toBe('¶ai:before\n\n¶call:read(path="a.ts")\n<out>\nfile body\n</out>\n\n¶ai:after');
 	});
 
 	it("does not split assistant prose around a useless tool call", () => {
@@ -759,7 +772,7 @@ describe("serializeConversation", () => {
 			{ ...createToolResultMessage("No matches found"), toolCallId: "c-drop", useless: true } as Message,
 		]);
 		// The useless call vanishes and its surrounding prose stays in one block.
-		expect(out).toBe("# Assistant ¶\nbefore\nafter");
+		expect(out).toBe("¶ai:before\nafter");
 	});
 
 	it("drops blank text/thinking blocks instead of emitting an empty assistant heading", () => {
@@ -774,8 +787,8 @@ describe("serializeConversation", () => {
 			],
 			{ dimToolResults: false },
 		);
-		expect(out).toBe('# Tool call ¶\nread(path="a.ts")\n<out>\nbody\n</out>');
-		expect(out).not.toContain("# Assistant ¶");
+		expect(out).toBe('¶call:read(path="a.ts")\n<out>\nbody\n</out>');
+		expect(out).not.toContain("¶ai:");
 	});
 
 	it("wraps tool-result bodies in dim toggles by default and strips stray toggles from content", () => {
@@ -785,7 +798,7 @@ describe("serializeConversation", () => {
 		]);
 		expect(out).toContain(`<out>\n${snapcompact.DIM_ON}ok${snapcompact.DIM_OFF}\n</out>`);
 		// A stray toggle in user content cannot forge a dim span.
-		expect(out).toContain("# User ¶\nhello world");
+		expect(out).toContain("¶user:hello world");
 	});
 
 	it("skips tool call/result pairs flagged useless", () => {
@@ -802,6 +815,26 @@ describe("serializeConversation", () => {
 		expect(out).not.toContain("zzz_nothing");
 		expect(out).not.toContain("No matches found");
 	});
+
+	it("merges consecutive blocks of the same role", () => {
+		const out = snapcompact.serializeConversation([
+			createUserMessage("hello"),
+			createUserMessage("world"),
+			createAssistantMessage([{ type: "text", text: "hi" }]),
+			createAssistantMessage([{ type: "text", text: "there" }]),
+		]);
+		expect(out).toBe("¶user:hello\nworld\n\n¶ai:hi\nthere");
+	});
+
+	it("merges consecutive tool calls under a single prefix", () => {
+		const out = snapcompact.serializeConversation([
+			createAssistantMessage([
+				{ type: "toolCall", id: "c1", name: "read", arguments: { path: "a.ts" } },
+				{ type: "toolCall", id: "c2", name: "read", arguments: { path: "b.ts" } },
+			]),
+		]);
+		expect(out).toBe('¶call:read(path="a.ts")\nread(path="b.ts")');
+	});
 });
 
 describe("compact", () => {
@@ -815,6 +848,9 @@ describe("compact", () => {
 		expect(result.tokensBefore).toBe(99000);
 		expect(result.summary).toContain("You are resuming a prior conversation.");
 		expect(result.summary).toContain("HISTORY");
+		expect(result.summary).toContain("`¶user:`, `¶think:`, `¶ai:`, and `¶call:`");
+		expect(result.summary).toContain("Following lines without a `¶…:` prefix remain in the current scope.");
+		expect(result.summary).toContain("`¶call:name(args)//intent`");
 		expect(result.summary).toContain("FILES\n===================\n# src/\nauth.ts (Read)\nlogin.ts (Write)");
 
 		const archive = snapcompact.getPreservedArchive(result.preserveData);
@@ -923,6 +959,34 @@ describe("compact", () => {
 		expect(archive?.frames.length).toBe(5);
 	});
 
+	it("re-compacting with a smaller maxFrames than the previous archive shrinks the frame count", async () => {
+		const first = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [
+					createUserMessage(`HEAD SENTINEL. ${"Important fact number one. ".repeat(1000)}TAIL SENTINEL.`),
+				],
+			}),
+			{ frameSize: TEST_FRAME_SIZE, maxFrames: 7 },
+		);
+		const firstArchive = snapcompact.getPreservedArchive(first.preserveData);
+		expect(firstArchive?.frames.length).toBe(7);
+
+		// No new messages: rebuild the SAME archive at a reduced budget — the
+		// dead-end rescue path for a trailing over-threshold archive.
+		const shrunk = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [],
+				previousSummary: first.summary,
+				previousPreserveData: first.preserveData,
+			}),
+			{ frameSize: TEST_FRAME_SIZE, maxFrames: 3 },
+		);
+		const shrunkArchive = snapcompact.getPreservedArchive(shrunk.preserveData);
+		expect(shrunkArchive?.frames.length).toBeGreaterThan(0);
+		expect(shrunkArchive?.frames.length).toBeLessThanOrEqual(3);
+		expect(shrunkArchive?.textHead ?? shrunkArchive?.text).toContain("HEAD SENTINEL.");
+	});
+
 	it("keeps the original text head across later compactions", async () => {
 		const first = await snapcompact.compact(
 			makePreparation({
@@ -1000,6 +1064,57 @@ describe("compact", () => {
 		expect(second.summary).not.toContain("[Summary of earlier history]");
 		expect(second.preserveData?.openaiRemoteCompaction).toBeUndefined();
 		expect(second.preserveData?.appKey).toBe("kept");
+	});
+
+	it("scrubs legacy ¶think: sections from the prior archive when thinking is excluded", async () => {
+		const first = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [
+					createUserMessage("Investigate the flaky auth test."),
+					createAssistantMessage([
+						{ type: "thinking", thinking: "legacy private chain of thought" },
+						{ type: "text", text: "The token clock is skewed." },
+					]),
+				],
+			}),
+			{ frameSize: TEST_FRAME_SIZE },
+		);
+		expect(snapcompact.getPreservedArchive(first.preserveData)?.text ?? "").toContain("¶think:");
+
+		const second = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [createUserMessage("Continue after switching to Claude.")],
+				previousPreserveData: first.preserveData,
+			}),
+			{ frameSize: TEST_FRAME_SIZE, includeThinking: false },
+		);
+		const archiveText = snapcompact.getPreservedArchive(second.preserveData)?.text ?? "";
+		expect(archiveText).not.toContain("¶think:");
+		expect(archiveText).not.toContain("legacy private chain of thought");
+		expect(archiveText).toContain("Investigate the flaky auth test.");
+		expect(archiveText).toContain("The token clock is skewed.");
+	});
+
+	it("keeps legacy ¶think: sections when thinking stays included", async () => {
+		const first = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [
+					createAssistantMessage([
+						{ type: "thinking", thinking: "legacy private chain of thought" },
+						{ type: "text", text: "Visible reply." },
+					]),
+				],
+			}),
+			{ frameSize: TEST_FRAME_SIZE },
+		);
+		const second = await snapcompact.compact(
+			makePreparation({
+				messagesToSummarize: [createUserMessage("Another turn.")],
+				previousPreserveData: first.preserveData,
+			}),
+			{ frameSize: TEST_FRAME_SIZE },
+		);
+		expect(snapcompact.getPreservedArchive(second.preserveData)?.text ?? "").toContain("¶think:");
 	});
 });
 

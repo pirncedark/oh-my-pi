@@ -111,15 +111,12 @@ function thinkingPair(baseId: string, name: string): EffortVariantFamily {
 	};
 }
 
-type DevinTierRoutes = Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh", string>>;
+type DevinTierRoutes = Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max", string>>;
 
-const DEVIN_FIVE_TIER_EFFORTS: readonly Effort[] = [
-	Effort.Minimal,
-	Effort.Low,
-	Effort.Medium,
-	Effort.High,
-	Effort.XHigh,
-];
+/** Devin families with a `-max` sibling: five wire tiers, `low` floor. */
+const DEVIN_FIVE_TIER_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
+/** Devin families topping out at `-xhigh` (pre-5.6 GPT, 5.6 fast lanes). */
+const DEVIN_FOUR_TIER_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
 
 function devinTierFamily(
 	id: string,
@@ -132,11 +129,7 @@ function devinTierFamily(
 	for (const effort of efforts) {
 		switch (effort) {
 			case Effort.Minimal:
-				if (routes.minimal) {
-					routing[effort] = routes.minimal;
-				} else if (routes.low) {
-					routing[effort] = routes.low;
-				}
+				if (routes.minimal) routing[effort] = routes.minimal;
 				break;
 			case Effort.Low:
 				if (routes.low) routing[effort] = routes.low;
@@ -150,11 +143,20 @@ function devinTierFamily(
 			case Effort.XHigh:
 				if (routes.xhigh) routing[effort] = routes.xhigh;
 				break;
+			case Effort.Max:
+				if (routes.max) routing[effort] = routes.max;
+				break;
 		}
 	}
-	const members = [routes.off, routes.minimal, routes.low, routes.medium, routes.high, routes.xhigh].filter(
-		(member, index, items): member is string => typeof member === "string" && items.indexOf(member) === index,
-	);
+	const members = [
+		routes.off,
+		routes.minimal,
+		routes.low,
+		routes.medium,
+		routes.high,
+		routes.xhigh,
+		routes.max,
+	].filter((member, index, items): member is string => typeof member === "string" && items.indexOf(member) === index);
 	return {
 		id,
 		name,
@@ -169,11 +171,9 @@ function devinTierFamily(
 }
 
 /**
- * GPT-5.6 (Luna/Sol/Terra) adds a genuine `max` tier above `xhigh`, so the
- * standard family shifts every user effort up one notch (`minimal` → `-low`
- * … `xhigh` → `-max`), mirroring the Opus 4.7+ five-tier mapping. Devin
- * serves no `-max-priority` sibling, so the fast family keeps the direct
- * `low..xhigh` `-priority` scale.
+ * GPT-5.6 (Luna/Sol/Terra) serves per-tier siblings for the full five-tier
+ * `low..max` wire scale; user efforts route 1:1 onto them. Devin serves no
+ * `-max-priority` sibling, so the fast family tops out at `xhigh`.
  */
 function devinGpt56Families(variant: "luna" | "sol" | "terra", name: string): readonly EffortVariantFamily[] {
 	const base = `gpt-5-6-${variant}`;
@@ -183,11 +183,11 @@ function devinGpt56Families(variant: "luna" | "sol" | "terra", name: string): re
 			name,
 			{
 				off: `${base}-none`,
-				minimal: `${base}-low`,
-				low: `${base}-medium`,
-				medium: `${base}-high`,
-				high: `${base}-xhigh`,
-				xhigh: `${base}-max`,
+				low: `${base}-low`,
+				medium: `${base}-medium`,
+				high: `${base}-high`,
+				xhigh: `${base}-xhigh`,
+				max: `${base}-max`,
 			},
 			DEVIN_FIVE_TIER_EFFORTS,
 		),
@@ -201,7 +201,7 @@ function devinGpt56Families(variant: "luna" | "sol" | "terra", name: string): re
 				high: `${base}-high-priority`,
 				xhigh: `${base}-xhigh-priority`,
 			},
-			DEVIN_FIVE_TIER_EFFORTS,
+			DEVIN_FOUR_TIER_EFFORTS,
 		),
 	];
 }
@@ -227,13 +227,12 @@ const GEMINI_3_PRO_FAMILY_BUDGETS: Readonly<Partial<Record<Effort, number>>> = {
 };
 
 /**
- * The two Cloud Code Assist providers share the same Antigravity discovery list
- * but disagree on the thinking transport: `google-antigravity` (daily-cloudcode-pa)
- * sends an explicit `thinkingBudget` (verified against captured requests), while
- * `google-gemini-cli` (cloudcode-pa) follows the official Gemini CLI and uses
- * `thinkingLevel`. The Gemini 3.x families therefore differ only in thinking
- * transport (and, for Flash, the per-tier wire-id routing); everything else is
- * shared verbatim.
+ * Cloud Code Assist's legacy Gemini 3.5 Flash and 3.1 Pro families use
+ * different thinking transports: `google-antigravity` (daily-cloudcode-pa)
+ * sends captured `thinkingBudget` values, while `google-gemini-cli`
+ * (cloudcode-pa) follows the official Gemini CLI and uses `thinkingLevel`.
+ * Gemini 3.6 exposes one wire id per level and uses `thinkingLevel` on both
+ * endpoints.
  */
 function geminiFlashFamily(mode: "budget" | "google-level"): EffortVariantFamily {
 	const budget = mode === "budget";
@@ -265,6 +264,23 @@ function geminiFlashFamily(mode: "budget" | "google-level"): EffortVariantFamily
 		extraAliases: ["gemini-3-flash"],
 	};
 }
+
+const GEMINI_36_FLASH_FAMILY: EffortVariantFamily = {
+	id: "gemini-3.6-flash",
+	name: "Gemini 3.6 Flash",
+	members: ["gemini-3.6-flash-low", "gemini-3.6-flash-medium", "gemini-3.6-flash-high", "gemini-3.6-flash-tiered"],
+	routing: {
+		[Effort.Minimal]: "gemini-3.6-flash-low",
+		[Effort.Low]: "gemini-3.6-flash-low",
+		[Effort.Medium]: "gemini-3.6-flash-medium",
+		[Effort.High]: "gemini-3.6-flash-high",
+	},
+	thinking: {
+		mode: "google-level",
+		efforts: GEMINI_3_FLASH_FAMILY_EFFORTS,
+		requiresEffort: true,
+	},
+};
 
 function geminiProFamily(mode: "budget" | "google-level"): EffortVariantFamily {
 	const budget = mode === "budget";
@@ -346,109 +362,70 @@ const SHARED_CCA_FAMILIES: readonly EffortVariantFamily[] = [
 	thinkingPair("gemini-2.5-flash", "Gemini 2.5 Flash"),
 ];
 
-/** `google-antigravity` (daily-cloudcode-pa): Gemini 3.x on the budget transport. */
+/** `google-antigravity` Gemini families, using each generation's native transport. */
 export const ANTIGRAVITY_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
-	families: [geminiFlashFamily("budget"), geminiProFamily("budget"), ...SHARED_CCA_FAMILIES],
+	families: [GEMINI_36_FLASH_FAMILY, geminiFlashFamily("budget"), geminiProFamily("budget"), ...SHARED_CCA_FAMILIES],
 };
 
-/** `google-gemini-cli` (cloudcode-pa): Gemini 3.x on the level transport (official CLI parity). */
+/** `google-gemini-cli` Gemini families on the official CLI's level transport. */
 export const GEMINI_CLI_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
-	families: [geminiFlashFamily("google-level"), geminiProFamily("google-level"), ...SHARED_CCA_FAMILIES],
+	families: [
+		GEMINI_36_FLASH_FAMILY,
+		geminiFlashFamily("google-level"),
+		geminiProFamily("google-level"),
+		...SHARED_CCA_FAMILIES,
+	],
 };
 export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 	families: [
-		{
-			id: "claude-opus-4-7",
-			name: "Claude Opus 4.7",
-			members: [
-				"claude-opus-4-7-low",
-				"claude-opus-4-7-medium",
-				"claude-opus-4-7-high",
-				"claude-opus-4-7-xhigh",
-				"claude-opus-4-7-max",
-			],
-			routing: {
-				[Effort.Minimal]: "claude-opus-4-7-low",
-				[Effort.Low]: "claude-opus-4-7-medium",
-				[Effort.Medium]: "claude-opus-4-7-high",
-				[Effort.High]: "claude-opus-4-7-xhigh",
-				[Effort.XHigh]: "claude-opus-4-7-max",
+		devinTierFamily(
+			"claude-opus-4-7",
+			"Claude Opus 4.7",
+			{
+				low: "claude-opus-4-7-low",
+				medium: "claude-opus-4-7-medium",
+				high: "claude-opus-4-7-high",
+				xhigh: "claude-opus-4-7-xhigh",
+				max: "claude-opus-4-7-max",
 			},
-			thinking: {
-				mode: "effort",
-				efforts: DEVIN_FIVE_TIER_EFFORTS,
-				requiresEffort: true,
+			DEVIN_FIVE_TIER_EFFORTS,
+		),
+		devinTierFamily(
+			"claude-opus-4-7-fast",
+			"Claude Opus 4.7 Fast",
+			{
+				low: "claude-opus-4-7-low-fast",
+				medium: "claude-opus-4-7-medium-fast",
+				high: "claude-opus-4-7-high-fast",
+				xhigh: "claude-opus-4-7-xhigh-fast",
+				max: "claude-opus-4-7-max-fast",
 			},
-		},
-		{
-			id: "claude-opus-4-7-fast",
-			name: "Claude Opus 4.7 Fast",
-			members: [
-				"claude-opus-4-7-low-fast",
-				"claude-opus-4-7-medium-fast",
-				"claude-opus-4-7-high-fast",
-				"claude-opus-4-7-xhigh-fast",
-				"claude-opus-4-7-max-fast",
-			],
-			routing: {
-				[Effort.Minimal]: "claude-opus-4-7-low-fast",
-				[Effort.Low]: "claude-opus-4-7-medium-fast",
-				[Effort.Medium]: "claude-opus-4-7-high-fast",
-				[Effort.High]: "claude-opus-4-7-xhigh-fast",
-				[Effort.XHigh]: "claude-opus-4-7-max-fast",
+			DEVIN_FIVE_TIER_EFFORTS,
+		),
+		devinTierFamily(
+			"claude-opus-4-8",
+			"Claude Opus 4.8",
+			{
+				low: "claude-opus-4-8-low",
+				medium: "claude-opus-4-8-medium",
+				high: "claude-opus-4-8-high",
+				xhigh: "claude-opus-4-8-xhigh",
+				max: "claude-opus-4-8-max",
 			},
-			thinking: {
-				mode: "effort",
-				efforts: DEVIN_FIVE_TIER_EFFORTS,
-				requiresEffort: true,
+			DEVIN_FIVE_TIER_EFFORTS,
+		),
+		devinTierFamily(
+			"claude-opus-4-8-fast",
+			"Claude Opus 4.8 Fast",
+			{
+				low: "claude-opus-4-8-low-fast",
+				medium: "claude-opus-4-8-medium-fast",
+				high: "claude-opus-4-8-high-fast",
+				xhigh: "claude-opus-4-8-xhigh-fast",
+				max: "claude-opus-4-8-max-fast",
 			},
-		},
-		{
-			id: "claude-opus-4-8",
-			name: "Claude Opus 4.8",
-			members: [
-				"claude-opus-4-8-low",
-				"claude-opus-4-8-medium",
-				"claude-opus-4-8-high",
-				"claude-opus-4-8-xhigh",
-				"claude-opus-4-8-max",
-			],
-			routing: {
-				[Effort.Minimal]: "claude-opus-4-8-low",
-				[Effort.Low]: "claude-opus-4-8-medium",
-				[Effort.Medium]: "claude-opus-4-8-high",
-				[Effort.High]: "claude-opus-4-8-xhigh",
-				[Effort.XHigh]: "claude-opus-4-8-max",
-			},
-			thinking: {
-				mode: "effort",
-				efforts: DEVIN_FIVE_TIER_EFFORTS,
-				requiresEffort: true,
-			},
-		},
-		{
-			id: "claude-opus-4-8-fast",
-			name: "Claude Opus 4.8 Fast",
-			members: [
-				"claude-opus-4-8-low-fast",
-				"claude-opus-4-8-medium-fast",
-				"claude-opus-4-8-high-fast",
-				"claude-opus-4-8-xhigh-fast",
-				"claude-opus-4-8-max-fast",
-			],
-			routing: {
-				[Effort.Minimal]: "claude-opus-4-8-low-fast",
-				[Effort.Low]: "claude-opus-4-8-medium-fast",
-				[Effort.Medium]: "claude-opus-4-8-high-fast",
-				[Effort.High]: "claude-opus-4-8-xhigh-fast",
-				[Effort.XHigh]: "claude-opus-4-8-max-fast",
-			},
-			thinking: {
-				mode: "effort",
-				efforts: DEVIN_FIVE_TIER_EFFORTS,
-				requiresEffort: true,
-			},
-		},
+			DEVIN_FIVE_TIER_EFFORTS,
+		),
 		devinTierFamily(
 			"gpt-5-2",
 			"GPT-5.2",
@@ -459,7 +436,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 				high: "MODEL_GPT_5_2_HIGH",
 				xhigh: "MODEL_GPT_5_2_XHIGH",
 			},
-			DEVIN_FIVE_TIER_EFFORTS,
+			DEVIN_FOUR_TIER_EFFORTS,
 		),
 		devinTierFamily(
 			"gpt-5-3-codex",
@@ -470,7 +447,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 				high: "gpt-5-3-codex-high",
 				xhigh: "gpt-5-3-codex-xhigh",
 			},
-			DEVIN_FIVE_TIER_EFFORTS,
+			DEVIN_FOUR_TIER_EFFORTS,
 		),
 		devinTierFamily(
 			"gpt-5-3-codex-fast",
@@ -481,7 +458,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 				high: "gpt-5-3-codex-high-priority",
 				xhigh: "gpt-5-3-codex-xhigh-priority",
 			},
-			DEVIN_FIVE_TIER_EFFORTS,
+			DEVIN_FOUR_TIER_EFFORTS,
 		),
 		devinTierFamily(
 			"gpt-5-4",
@@ -493,7 +470,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 				high: "gpt-5-4-high",
 				xhigh: "gpt-5-4-xhigh",
 			},
-			DEVIN_FIVE_TIER_EFFORTS,
+			DEVIN_FOUR_TIER_EFFORTS,
 		),
 		devinTierFamily(
 			"gpt-5-4-fast",
@@ -505,7 +482,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 				high: "gpt-5-4-high-priority",
 				xhigh: "gpt-5-4-xhigh-priority",
 			},
-			DEVIN_FIVE_TIER_EFFORTS,
+			DEVIN_FOUR_TIER_EFFORTS,
 		),
 		devinTierFamily(
 			"gpt-5-4-mini",
@@ -516,7 +493,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 				high: "gpt-5-4-mini-high",
 				xhigh: "gpt-5-4-mini-xhigh",
 			},
-			DEVIN_FIVE_TIER_EFFORTS,
+			DEVIN_FOUR_TIER_EFFORTS,
 		),
 		devinTierFamily(
 			"gpt-5-5",
@@ -528,7 +505,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 				high: "gpt-5-5-high",
 				xhigh: "gpt-5-5-xhigh",
 			},
-			DEVIN_FIVE_TIER_EFFORTS,
+			DEVIN_FOUR_TIER_EFFORTS,
 		),
 		devinTierFamily(
 			"gpt-5-5-fast",
@@ -540,7 +517,7 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 				high: "gpt-5-5-high-priority",
 				xhigh: "gpt-5-5-xhigh-priority",
 			},
-			DEVIN_FIVE_TIER_EFFORTS,
+			DEVIN_FOUR_TIER_EFFORTS,
 		),
 		...devinGpt56Families("luna", "GPT-5.6 Luna"),
 		...devinGpt56Families("sol", "GPT-5.6 Sol"),
@@ -575,6 +552,39 @@ export const DEVIN_VARIANT_COLLAPSE_TABLE: VariantCollapseTable = {
 				high: "MODEL_GOOGLE_GEMINI_3_0_FLASH_HIGH",
 			},
 			[Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
+		),
+		// GLM-5.2 200K — only the base wire UID `glm-5-2` is free on Devin's
+		// Coding Plan (verified via streamDevin: `glm-5-2-none` and `glm-5-2-max`
+		// both return "weekly usage quota exhausted" while `glm-5-2` streams
+		// successfully).  Route every effort to `glm-5-2` so the collapsed entry
+		// is always free; include the paid 200K variants as members so they are
+		// hidden from the model list.  The 1M-context variants stay as separate
+		// paid entries (collapsed below).
+		{
+			id: "glm-5-2",
+			name: "GLM-5.2",
+			members: ["glm-5-2", "glm-5-2-none", "glm-5-2-max"],
+			routing: {
+				[Effort.High]: "glm-5-2",
+				[Effort.XHigh]: "glm-5-2",
+			},
+			thinking: {
+				mode: "effort",
+				efforts: [Effort.High, Effort.XHigh],
+				requiresEffort: true,
+			},
+		},
+		// GLM-5.2 1M — paid variants that consume weekly quota.  Collapse the
+		// three 1M-context variants into one entry with proper effort routing.
+		devinTierFamily(
+			"glm-5-2-1m",
+			"GLM-5.2 1M",
+			{
+				off: "glm-5-2-none-1m",
+				high: "glm-5-2-1m",
+				xhigh: "glm-5-2-max-1m",
+			},
+			[Effort.High, Effort.XHigh],
 		),
 	],
 };

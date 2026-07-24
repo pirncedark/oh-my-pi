@@ -142,6 +142,9 @@ const CLIENT_CAPABILITIES = {
 			codeDescriptionSupport: true,
 			dataSupport: true,
 		},
+		diagnostic: {
+			dynamicRegistration: true,
+		},
 	},
 	window: {
 		workDoneProgress: true,
@@ -361,7 +364,15 @@ async function startMessageReader(client: LspClient): Promise<void> {
 						if (pending) {
 							client.pendingRequests.delete(message.id);
 							if ("error" in message && message.error) {
-								pending.reject(new Error(`LSP error: ${message.error.message}`));
+								// Include the JSON-RPC error code: `isMethodNotFoundError` matches
+								// `-32601` by substring, so method-not-found is recognized even when
+								// the server's message text is nonstandard (e.g. "Unknown request").
+								const code = message.error.code;
+								pending.reject(
+									new Error(
+										`LSP error${typeof code === "number" ? ` ${code}` : ""}: ${message.error.message}`,
+									),
+								);
 							} else {
 								pending.resolve(message.result);
 							}
@@ -428,7 +439,7 @@ async function handleConfigurationRequest(client: LspClient, message: LspJsonRpc
 	const items = params?.items ?? [];
 	const result = items.map(item => {
 		const section = item.section ?? "";
-		return client.config.settings?.[section] ?? {};
+		return client.config.settings?.[section] ?? null;
 	});
 	await sendResponse(client, message.id, result, "workspace/configuration");
 }
@@ -456,6 +467,58 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 	}
 }
 
+interface DynamicCapabilityRegistration {
+	id?: unknown;
+	method?: unknown;
+}
+
+interface DynamicCapabilityParams {
+	registrations?: DynamicCapabilityRegistration[];
+	unregisterations?: DynamicCapabilityRegistration[];
+	unregistrations?: DynamicCapabilityRegistration[];
+}
+
+function updateDynamicCapabilities(client: LspClient, message: LspJsonRpcRequest): void {
+	const params = message.params as DynamicCapabilityParams;
+	if (message.method === "client/registerCapability") {
+		if (!Array.isArray(params.registrations)) return;
+		let registrations = client.dynamicCapabilityRegistrations;
+		if (!registrations) {
+			registrations = new Map();
+			client.dynamicCapabilityRegistrations = registrations;
+		}
+		for (const registration of params.registrations) {
+			if (typeof registration.id === "string" && typeof registration.method === "string") {
+				registrations.set(registration.id, registration.method);
+			}
+		}
+		return;
+	}
+
+	const registrations = client.dynamicCapabilityRegistrations;
+	if (!registrations) return;
+	const unregistrations = params.unregisterations ?? params.unregistrations;
+	if (!Array.isArray(unregistrations)) return;
+	for (const registration of unregistrations) {
+		if (typeof registration.id === "string") {
+			registrations.delete(registration.id);
+		}
+	}
+}
+
+/** Whether the server advertised LSP 3.17 document diagnostic pulls statically or through registration. */
+export function supportsDocumentDiagnostics(client: LspClient): boolean {
+	const staticProvider = client.serverCapabilities?.diagnosticProvider;
+	if (staticProvider) return true;
+
+	const registrations = client.dynamicCapabilityRegistrations;
+	if (!registrations) return false;
+	for (const method of registrations.values()) {
+		if (method === "textDocument/diagnostic") return true;
+	}
+	return false;
+}
+
 /**
  * Respond to a server-initiated request.
  */
@@ -478,6 +541,7 @@ async function handleServerRequest(client: LspClient, message: LspJsonRpcRequest
 		return;
 	}
 	if (message.method === "client/registerCapability" || message.method === "client/unregisterCapability") {
+		updateDynamicCapabilities(client, message);
 		// Some servers block semantic requests until dynamic registration succeeds.
 		await sendResponse(client, message.id, null, message.method);
 		return;
@@ -685,6 +749,7 @@ export async function getOrCreateClient(
 			requestId: 0,
 			diagnostics: new Map(),
 			diagnosticsVersion: 0,
+			dynamicCapabilityRegistrations: new Map(),
 			openFiles: new Map(),
 			pendingRequests: new Map(),
 			messageBuffer: new Uint8Array(0),
@@ -750,8 +815,14 @@ export async function getOrCreateClient(
 
 			client.serverCapabilities = initResult.capabilities as LspClient["serverCapabilities"];
 
-			// Send initialized notification
+			// Finish the initialize handshake before publishing the client as ready.
 			await sendNotification(client, "initialized", {}, signal);
+			await sendNotification(
+				client,
+				"workspace/didChangeConfiguration",
+				{ settings: config.settings ?? {} },
+				signal,
+			);
 
 			client.status = "ready";
 			// Publish only after init succeeds: pre-init clients are reachable
@@ -781,6 +852,29 @@ export async function getOrCreateClient(
 
 	clientLocks.set(key, clientPromise);
 	return clientPromise;
+}
+
+/** Return an active or already-starting client without starting a language server. */
+export async function getActiveOrPendingClient(
+	config: ServerConfig,
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<LspClient | undefined> {
+	throwIfAborted(signal);
+	const client = clients.get(`${config.command}:${cwd}`);
+	if (client) {
+		client.lastActivity = Date.now();
+		return client;
+	}
+
+	const pending = clientLocks.get(`${config.command}:${cwd}`);
+	if (!pending) return undefined;
+	try {
+		return await untilAborted(signal, pending);
+	} catch {
+		throwIfAborted(signal);
+		return undefined;
+	}
 }
 
 /**
@@ -1095,9 +1189,19 @@ async function waitForExit(client: LspClient, timeoutMs: number): Promise<boolea
 }
 
 /**
- * Shutdown a specific client instance using the LSP shutdown/exit handshake.
+ * Tear down a specific client instance using the LSP shutdown/exit handshake.
+ *
+ * Removes the client from the registry by identity first (never evicting a
+ * newer client already republished under the same key), then performs a bounded
+ * graceful shutdown, force-killing and awaiting confirmed process exit.
+ *
+ * @returns `true` once the process is confirmed exited, `false` if it outlived
+ * the shutdown budget — callers reporting a restart must treat `false` as a
+ * failed teardown, not a completed restart.
  */
-async function shutdownClientInstance(client: LspClient): Promise<void> {
+export async function shutdownClientInstance(client: LspClient): Promise<boolean> {
+	if (clients.get(client.name) === client) clients.delete(client.name);
+
 	const err = new Error("LSP client shutdown");
 	for (const pending of Array.from(client.pendingRequests.values())) {
 		pending.reject(err);
@@ -1110,21 +1214,23 @@ async function shutdownClientInstance(client: LspClient): Promise<void> {
 	);
 	if (shutdownCompleted) {
 		await sendNotification(client, "exit", undefined).catch(() => {});
-		if (await waitForExit(client, EXIT_TIMEOUT_MS)) return;
+		if (await waitForExit(client, EXIT_TIMEOUT_MS)) return true;
 	}
 
 	client.proc.kill();
-	await waitForExit(client, EXIT_TIMEOUT_MS);
+	return await waitForExit(client, EXIT_TIMEOUT_MS);
 }
 
 /**
  * Shutdown a specific client by key.
+ *
+ * @returns `true` when the client is gone (already absent or confirmed exited),
+ * `false` if a live process outlived the shutdown budget.
  */
-export async function shutdownClient(key: string): Promise<void> {
+export async function shutdownClient(key: string): Promise<boolean> {
 	const client = clients.get(key);
-	if (!client) return;
-	clients.delete(key);
-	await shutdownClientInstance(client);
+	if (!client) return true;
+	return await shutdownClientInstance(client);
 }
 
 // =============================================================================

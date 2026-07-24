@@ -26,6 +26,7 @@ import {
 	TINY_TITLE_MODEL_OPTIONS,
 	TINY_TITLE_MODEL_VALUES,
 } from "../tiny/models";
+import { IMAGE_PROVIDER_CHOICES, type ImageProvider } from "../tools/image-providers";
 import {
 	DEFAULT_TTS_LOCAL_MODEL_KEY,
 	DEFAULT_TTS_VOICE,
@@ -35,7 +36,7 @@ import {
 	TTS_LOCAL_VOICE_VALUES,
 } from "../tts/models";
 import { EDIT_MODES } from "../utils/edit-mode";
-import { SEARCH_PROVIDER_OPTIONS, SEARCH_PROVIDER_PREFERENCES, type SearchProviderId } from "../web/search/types";
+import { SEARCH_PROVIDER_CHOICES, type SearchProviderId } from "../web/search/types";
 import {
 	SERVICE_TIER_ANTHROPIC_OPTIONS,
 	SERVICE_TIER_ANTHROPIC_VALUES,
@@ -66,6 +67,8 @@ import {
 // ═══════════════════════════════════════════════════════════════════════════
 // Schema Definition Types
 // ═══════════════════════════════════════════════════════════════════════════
+
+export type ModelRoleStorage = "global" | "project";
 
 export type SettingTab =
 	| "appearance"
@@ -117,7 +120,7 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
  */
 export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 	appearance: ["Theme", "Status Line", "Display", "Images"],
-	model: ["Thinking", "Sampling", "Prompt", "Retry & Fallback", "Advisor", "Vision"],
+	model: ["Thinking", "Sampling", "Prompt", "Retry & Fallback", "Advisor", "Prewalk", "Vision"],
 	interaction: [
 		"Input",
 		"Approvals",
@@ -138,6 +141,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Available Tools",
 		"Todos",
 		"Grep & Browser",
+		"Computer",
 		"GitHub",
 		"Output Limits",
 		"Execution",
@@ -205,6 +209,8 @@ interface UiNumber extends UiBase {
 }
 
 interface UiString extends UiBase {
+	/** Mask the value in both the settings row and text editor. */
+	secret?: boolean;
 	/**
 	 * Submenu options.
 	 *  - Array  → submenu with these choices.
@@ -214,9 +220,18 @@ interface UiString extends UiBase {
 	options?: ReadonlyArray<SubmenuOption> | "runtime";
 }
 
+interface UiArray extends UiBase {
+	/** Membership choices. Without options, an array setting has no UI representation (config-file only). */
+	options?: ReadonlyArray<SubmenuOption>;
+	/** Selection order is meaningful; the editor renders positions and supports reordering. */
+	ordered?: boolean;
+}
+
 /** Wide ui shape exposed to consumers that walk the schema generically. */
 export type AnyUiMetadata = UiBase & {
 	options?: ReadonlyArray<SubmenuOption> | "runtime";
+	secret?: boolean;
+	ordered?: boolean;
 };
 
 interface BooleanDef {
@@ -247,7 +262,7 @@ interface EnumDef<T extends readonly string[]> {
 interface ArrayDef<T> {
 	type: "array";
 	default: T[];
-	ui?: UiBase;
+	ui?: UiArray;
 }
 
 interface RecordDef<T> {
@@ -285,7 +300,7 @@ const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_STRING_RECORD: Record<string, string> = {};
 const EMPTY_NUMBER_RECORD: Record<string, number> = {};
 const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
-const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["job", "irc"];
+const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["hub"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
 export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
@@ -330,6 +345,25 @@ export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 			"^\\s*(echo|printf|cat\\s*<<)\\s+(?:(?:[^\"'>]|\"[^\"]*\"|'[^']*')|(?<!\\|)>{1,2}\\|?\\s*(?:\"/dev/(?:null|tty|stdout|stderr)\"|'/dev/(?:null|tty|stdout|stderr)'|/dev/(?:null|tty|stdout|stderr))(?:[\\s;&|]|$))*(?<!\\|)>{1,2}\\|?\\s*(?!(?:\"/dev/(?:null|tty|stdout|stderr)\"|'/dev/(?:null|tty|stdout|stderr)'|/dev/(?:null|tty|stdout|stderr))(?:[\\s;&|]|$))[$\\w./~\"'-]",
 		tool: "write",
 		message: "Use the `write` tool instead of echo/cat redirection. It handles encoding and provides confirmation.",
+	},
+	{
+		pattern: "^\\s*nohup\\s+|(?<!&)\\&\\s*$",
+		tool: "hub",
+		message:
+			'Use the `hub` tool (`op:"start"`) instead of nohup or background shell syntax so the process stays observable and managed.',
+	},
+	{
+		pattern:
+			"^\\s*(?:(?:bun|npm|pnpm|yarn)\\s+(?:run\\s+)?(?:dev|start)(?:\\s|$)|(?:vite|next\\s+dev|nuxt\\s+dev|nodemon|lldb|gdb|tail\\s+-f)(?:\\s|$)|docker\\s+compose\\s+up(?!.*(?:\\s-d(?:\\s|$)|--detach))(?:\\s|$))",
+		tool: "hub",
+		message:
+			'Use the `hub` tool (`op:"start"`) for services, watchers, and debuggers so other omp instances can observe and control them.',
+	},
+	{
+		pattern:
+			"^\\s*(?:(?:bun|npm|pnpm|yarn)\\s+(?:run\\s+)?\\S+|cargo\\s+watch|watchexec|pytest|vitest|jest|tsc)(?:.|\\n)*(?:--watch|-w)(?:\\s|$)",
+		tool: "hub",
+		message: 'Use the `hub` tool (`op:"start"`) for watch mode so its output, input, and lifecycle stay managed.',
 	},
 ];
 
@@ -401,6 +435,17 @@ export const SETTINGS_SCHEMA = {
 			label: "Enable Advisor",
 			description:
 				"Pair a second model (assigned to the 'advisor' role) that passively reviews each turn and injects notes.",
+		},
+	},
+	"prewalk.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Prewalk",
+			label: "Enable Prewalk",
+			description:
+				"Start on the active model, then switch to a fast/cheap model (default the 'smol' role) at the first edit/write after the plan nudge's todo list exists — the strong model plans, commits the todos, and starts the implementation before handing off. Overridable per session with --prewalk / --no-prewalk.",
 		},
 	},
 	"advisor.subagents": {
@@ -478,6 +523,30 @@ export const SETTINGS_SCHEMA = {
 	},
 
 	disabledExtensions: { type: "array", default: EMPTY_STRING_ARRAY },
+
+	modelRoleStorage: {
+		type: "enum",
+		values: ["global", "project"] as const,
+		default: "global",
+		ui: {
+			tab: "model",
+			group: "Prompt",
+			label: "Model Role Storage",
+			description: "Where model selector role assignments are saved",
+			options: [
+				{
+					value: "global",
+					label: "Global",
+					description: "Save role models in the active profile config (current behavior)",
+				},
+				{
+					value: "project",
+					label: "Per-project",
+					description: "Save project role models in .omp/config.yml; missing project roles use global defaults",
+				},
+			],
+		},
+	},
 
 	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
 
@@ -694,7 +763,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Output Limits",
 			label: "Output Column Cap",
 			description:
-				"Per-line byte cap for streaming tool outputs (bash, ssh, python, js eval) and `read`. Lines wider than this are ellipsis-truncated; remaining bytes up to the next newline are dropped. 0 disables.",
+				"Per-line byte cap for streaming tool outputs (bash, python, js eval) and `read`. Lines wider than this are ellipsis-truncated; remaining bytes up to the next newline are dropped. 0 disables.",
 			options: [
 				{ value: "0", label: "Off", description: "No per-line cap" },
 				{ value: "256", label: "256", description: "Tight" },
@@ -845,6 +914,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tui.titleState": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Terminal Title Run State",
+			description:
+				"Show the agent run state in the terminal title's separator — an animated spinner while working, '>' when it's your turn, '!' when the agent is waiting on you",
+		},
+	},
+
 	"tui.hyperlinks": {
 		type: "enum",
 		values: ["off", "auto", "always"] as const,
@@ -865,6 +946,17 @@ export const SETTINGS_SCHEMA = {
 			group: "Display",
 			label: "Tight Layout",
 			description: "Remove the 1-character horizontal padding from the left and right of the terminal output",
+		},
+	},
+	"tui.scrollbackRebuild": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Rewrite Scrollback",
+			description:
+				"Erase and replay terminal scrollback when a block's final form replaces its live preview. When off (default), stale preview copies remain in history and the final content is appended below.",
 		},
 	},
 
@@ -918,6 +1010,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"display.collapseCompacted": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Collapse Compacted History",
+			description:
+				"Collapse pre-compaction history behind the summary divider on the live transcript; disable to keep the full transcript inline with dividers at each compaction point",
+		},
+	},
+
 	showHardwareCursor: {
 		type: "boolean",
 		default: true, // will be computed based on platform if undefined
@@ -929,6 +1033,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tui.imeSafeCursor": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "IME-Safe Prompt Layout",
+			description: "Move the prompt's bottom border to a separate row so macOS IME preedit cannot displace it",
+		},
+	},
+
 	// ────────────────────────────────────────────────────────────────────────
 	// Model
 	// ────────────────────────────────────────────────────────────────────────
@@ -936,7 +1051,7 @@ export const SETTINGS_SCHEMA = {
 	// Reasoning and prompts
 	defaultThinkingLevel: {
 		type: "enum",
-		values: [...THINKING_EFFORTS, AUTO_THINKING, "max"],
+		values: [...THINKING_EFFORTS, AUTO_THINKING],
 		default: "high",
 		ui: {
 			tab: "model",
@@ -1095,6 +1210,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"workspace.additionalDirectories": {
+		type: "array",
+		default: [] as string[],
+		ui: {
+			tab: "context",
+			group: "General",
+			label: "Additional Workspace Dirs",
+			description:
+				"Extra workspace directories added to every session as additional roots (multi-root workspace). Managed live via /add-dir and /remove-dir. Paths resolve relative to cwd; absolute paths recommended. The agent is told these roots exist and can read/grep/glob them.",
+		},
+	},
+
 	personality: {
 		type: "enum",
 		values: ["default", "friendly", "pragmatic", "none"] as const,
@@ -1239,7 +1366,7 @@ export const SETTINGS_SCHEMA = {
 	textVerbosity: {
 		type: "enum",
 		values: ["low", "medium", "high"] as const,
-		default: "high",
+		default: "medium",
 		ui: {
 			tab: "model",
 			group: "Sampling",
@@ -1247,8 +1374,8 @@ export const SETTINGS_SCHEMA = {
 			description: "OpenAI Responses and Codex response verbosity (low, medium, or high)",
 			options: [
 				{ value: "low", label: "Low", description: "Prefer concise responses" },
-				{ value: "medium", label: "Medium", description: "Balance brevity and detail" },
-				{ value: "high", label: "High", description: "Prefer detailed responses (default)" },
+				{ value: "medium", label: "Medium", description: "Balance brevity and detail (default)" },
+				{ value: "high", label: "High", description: "Prefer detailed responses" },
 			],
 		},
 	},
@@ -1367,6 +1494,65 @@ export const SETTINGS_SCHEMA = {
 			description: "Allow retry recovery to switch to configured fallback models",
 		},
 	},
+	"retry.usageAwareFallback": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Usage-Aware Fallback",
+			description:
+				"Use reliable coding-plan quota reports to prefer same-provider accounts, then configured fallback models, before a hard usage limit. Ordinary configured API keys are excluded.",
+		},
+	},
+	"retry.usageReservePct": {
+		type: "number",
+		default: 10,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Reserve Margin",
+			description:
+				"Treat a coding-plan model as near its limit below this remaining percentage. Unknown or unmapped usage keeps the primary model.",
+			condition: "usageAwareFallbackEnabled",
+			options: [
+				{ value: "5", label: "5%", description: "Act only when nearly exhausted" },
+				{ value: "10", label: "10%", description: "Balanced safety margin" },
+				{ value: "15", label: "15%", description: "Conservative" },
+				{ value: "20", label: "20%", description: "Early protection" },
+				{ value: "25", label: "25%", description: "Very conservative" },
+			],
+		},
+	},
+	"retry.usageReservePolicy": {
+		type: "enum",
+		values: ["confirm", "auto", "fail-closed"] as const,
+		default: "confirm",
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Reserve Policy",
+			description: "What to do when every same-provider coding-plan account is inside the reserve margin.",
+			condition: "usageAwareFallbackEnabled",
+			options: [
+				{
+					value: "confirm",
+					label: "Confirm interactively",
+					description: "Keep interactive sessions on the primary until confirmed; background agents auto-fallback",
+				},
+				{
+					value: "auto",
+					label: "Auto-fallback",
+					description: "Always select the next eligible configured fallback",
+				},
+				{
+					value: "fail-closed",
+					label: "Fail closed",
+					description: "Do not spend reserve quota or select a fallback",
+				},
+			],
+		},
+	},
 	"retry.fallbackChains": {
 		type: "record",
 		default: {} as Record<string, string[]>,
@@ -1375,7 +1561,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Retry & Fallback",
 			label: "Retry Fallback Chains",
 			description:
-				'JSON object mapping model roles to ordered fallback model selectors, e.g. {"default":["openai/gpt-4o-mini"]}.',
+				'JSON object mapping model roles, model selectors ("provider/model-id"), or provider wildcards ("provider/*") to ordered fallback selectors, e.g. {"default":["openai/gpt-4o-mini"],"google-antigravity/*":["google/*","google-vertex/*"]}. Model-oriented keys apply whenever that model/provider is active, regardless of role; a "provider/*" entry keeps the failing model\'s id and swaps the provider. An id-prefixed wildcard ("openrouter/google/*") re-prefixes the failing model\'s bare id (google-antigravity/gemini-x -> openrouter/google/gemini-x) and, used as a key, matches only that provider\'s ids under the prefix.',
 		},
 	},
 	"retry.fallbackRevertPolicy": {
@@ -1677,6 +1863,18 @@ export const SETTINGS_SCHEMA = {
 			group: "Notifications",
 			label: "Completion Notification",
 			description: "Notify when the agent finishes a turn",
+		},
+	},
+
+	"error.notify": {
+		type: "enum",
+		values: ["on", "off"] as const,
+		default: "off",
+		ui: {
+			tab: "interaction",
+			group: "Notifications",
+			label: "Error Notification",
+			description: "Notify when the agent stops with an error",
 		},
 	},
 
@@ -2355,9 +2553,8 @@ export const SETTINGS_SCHEMA = {
 	"memories.summaryInjectionTokenLimit": { type: "number", default: 5000 },
 
 	// Memory backend selector — picks between local memories pipeline,
-	// Mnemopi local SQLite, Hindsight remote memory, or off. Legacy
-	// `memories.enabled` keeps gating the local backend; see config/settings.ts
-	// migration for details.
+	// Mnemopi local SQLite, Hindsight remote memory, or off. The legacy
+	// `memories.enabled` flag is migration input only; see config/settings.ts.
 	"memory.backend": {
 		type: "enum",
 		values: ["off", "local", "hindsight", "mnemopi"] as const,
@@ -2402,7 +2599,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Auto-Learn",
 			label: "Auto-run capture at stop",
 			description:
-				"When on, auto-run one capture turn at stop (uses extra tokens). Off = passive reminder on your next turn.",
+				"When on, auto-run one private capture turn at stop (uses extra tokens). When off, only standing auto-learn guidance remains.",
 			condition: "autolearnActive",
 		},
 	},
@@ -2597,14 +2794,14 @@ export const SETTINGS_SCHEMA = {
 			group: "Mnemopi",
 			label: "Mnemopi LLM Mode",
 			description:
-				"Use no LLM, the online tiny model (the TINY role from /models, else pi/smol), or a remote OpenAI-compatible endpoint",
+				"Use no LLM, the online tiny model (the TINY role from /models, else @smol), or a remote OpenAI-compatible endpoint",
 			condition: "mnemopiActive",
 			options: [
 				{ value: "none", label: "None", description: "Disable Mnemopi LLM-backed extraction" },
 				{
 					value: "smol",
 					label: "Online (tiny)",
-					description: "Use the online tiny model (the TINY role from /models, else pi/smol)",
+					description: "Use the online tiny model (the TINY role from /models, else @smol)",
 				},
 				{ value: "remote", label: "Remote", description: "Use the Mnemopi remote LLM settings below" },
 			],
@@ -2663,7 +2860,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"hindsight.apiToken": { type: "string", default: undefined },
+	"hindsight.apiToken": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "memory",
+			group: "Hindsight",
+			label: "Hindsight API Token",
+			description: "Bearer token for authenticated Hindsight servers",
+			condition: "hindsightActive",
+			secret: true,
+		},
+	},
 
 	"hindsight.bankId": {
 		type: "string",
@@ -2770,6 +2978,11 @@ export const SETTINGS_SCHEMA = {
 	"hindsight.recallTypes": { type: "array", default: HINDSIGHT_RECALL_TYPES_DEFAULT },
 
 	"hindsight.debug": { type: "boolean", default: false },
+
+	"hindsight.requestTimeoutMs": { type: "number", default: 30_000 },
+	"hindsight.reflectTimeoutMs": { type: "number", default: 120_000 },
+	"hindsight.recallTimeoutMs": { type: "number", default: 30_000 },
+	"hindsight.retainTimeoutMs": { type: "number", default: 60_000 },
 
 	"hindsight.mentalModelsEnabled": {
 		type: "boolean",
@@ -2959,6 +3172,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"edit.enforceSeenLines": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "files",
+			group: "Editing",
+			label: "Enforce Seen-Line Guard",
+			description: "Reject edits anchored on lines a prior read/search never displayed in full",
+		},
+	},
+
 	readLineNumbers: {
 		type: "boolean",
 		default: false,
@@ -2985,6 +3209,17 @@ export const SETTINGS_SCHEMA = {
 				{ value: "1000", label: "1000 lines" },
 				{ value: "5000", label: "5000 lines" },
 			],
+		},
+	},
+
+	"read.renderMarkdown": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "files",
+			group: "Reading",
+			label: "Markdown Previews",
+			description: "Render Markdown read results as formatted terminal Markdown previews instead of raw source",
 		},
 	},
 
@@ -3167,6 +3402,17 @@ export const SETTINGS_SCHEMA = {
 			description: "Automatically background long-running bash commands and deliver the result later",
 		},
 	},
+	"bash.patterns": {
+		type: "array",
+		default: [],
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "Bash Approval Patterns",
+			description:
+				"Ordered bash command approval rules. Each item has match and approval fields; only '*' wildcards are supported.",
+		},
+	},
 
 	// Bash interceptor
 	"bashInterceptor.enabled": {
@@ -3181,6 +3427,29 @@ export const SETTINGS_SCHEMA = {
 	},
 	"bashInterceptor.patterns": { type: "array", default: DEFAULT_BASH_INTERCEPTOR_RULES },
 
+	"bash.direnv": {
+		type: "enum",
+		values: ["auto", "off"] as const,
+		default: "auto",
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "direnv Auto-Load",
+			description:
+				"Auto-load a repo's direnv/devenv `.envrc` into the bash session so devenv tools and env vars are present without manual `direnv exec`. Honors direnv's allow list: an `.envrc` you haven't `direnv allow`ed is never executed",
+		},
+	},
+	"bash.direnvLoadTimeoutMs": {
+		type: "number",
+		default: 30_000,
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "direnv Load Timeout (ms)",
+			description:
+				"Max wait for the first `direnv export` (a cold devenv shell can be slow); on timeout the session runs without the direnv env",
+		},
+	},
 	// Shell output minimizer
 	"shellMinimizer.enabled": {
 		type: "boolean",
@@ -3350,7 +3619,7 @@ export const SETTINGS_SCHEMA = {
 					value: "write",
 					label: "Write",
 					description:
-						"Auto-approve read-only and write tools; require confirmation for exec tools such as bash, eval, browser, task, and ssh.",
+						"Auto-approve read-only and write tools; require confirmation for exec tools such as bash, eval, browser, and task.",
 				},
 				{
 					value: "yolo",
@@ -3385,7 +3654,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"todo.reminders.max": {
+	"todo.remindersMax": {
 		type: "number",
 		default: 3,
 		ui: {
@@ -3485,7 +3754,7 @@ export const SETTINGS_SCHEMA = {
 
 	"astGrep.enabled": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "tools",
 			group: "Available Tools",
@@ -3518,6 +3787,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"launch.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			group: "Available Tools",
+			label: "Launch",
+			description: "Enable the launch tool for supervising shared long-running project processes",
+		},
+	},
+
 	"speechgen.enabled": {
 		type: "boolean",
 		default: false,
@@ -3526,6 +3806,17 @@ export const SETTINGS_SCHEMA = {
 			group: "Available Tools",
 			label: "Speech Generation",
 			description: "Enable the tts tool for on-device (Kokoro) or xAI Grok Voice speech-file synthesis",
+		},
+	},
+	"generate_image.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			group: "Available Tools",
+			label: "Generate Image",
+			description:
+				"Enable the generate_image tool (text-to-image generation and editing). Exposed as an xd:// device when tools.xdev is on.",
 		},
 	},
 
@@ -3537,6 +3828,66 @@ export const SETTINGS_SCHEMA = {
 			group: "Available Tools",
 			label: "Inspect Image",
 			description: "Enable the inspect_image tool, delegating image understanding to a vision-capable model",
+		},
+	},
+
+	"computer.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			group: "Available Tools",
+			label: "Computer",
+			description: "Enable native host-desktop screenshots and input for OpenAI computer use",
+		},
+	},
+
+	"computer.backend": {
+		type: "enum",
+		values: ["auto", "native"] as const,
+		default: "auto",
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Computer Backend",
+			description: "Select automatic or explicit platform-native desktop capture and input",
+			options: [
+				{ value: "auto", label: "Auto" },
+				{ value: "native", label: "Native" },
+			],
+		},
+	},
+
+	"computer.display": {
+		type: "string",
+		default: "all",
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Computer Display",
+			description: "Composite all displays or select a native display id",
+		},
+	},
+
+	"computer.maxWidth": {
+		type: "number",
+		default: 1920,
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Computer Screenshot Width",
+			description: "Maximum composite screenshot width in pixels",
+		},
+	},
+
+	"computer.maxHeight": {
+		type: "number",
+		default: 1200,
+		ui: {
+			tab: "tools",
+			group: "Computer",
+			label: "Computer Screenshot Height",
+			description: "Maximum composite screenshot height in pixels",
 		},
 	},
 
@@ -3630,6 +3981,17 @@ export const SETTINGS_SCHEMA = {
 			group: "Available Tools",
 			label: "Web Search",
 			description: "Enable the web_search tool for live web results",
+		},
+	},
+
+	"ask.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			group: "Available Tools",
+			label: "Ask",
+			description: "Enable the ask tool for interactive user questions",
 		},
 	},
 
@@ -3746,7 +4108,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Execution",
 			label: "Max Poll Time",
 			description:
-				"How long the poll tool waits for background job updates before returning the current state. A fixed value waits that exact duration every time. `smart` adapts: it starts at 5s and lengthens with each back-to-back poll (up to 5m), then resets to 5s after about a minute without polling.",
+				"How long a `hub` wait watches background jobs before returning the current state. A fixed value waits that exact duration every time. `smart` adapts: it starts at 5s and lengthens with each back-to-back wait (up to 5m), then resets to 5s after about a minute without waiting.",
 			options: [
 				{ value: "5s", label: "5 seconds" },
 				{ value: "10s", label: "10 seconds" },
@@ -3765,7 +4127,8 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			group: "Execution",
 			label: "IRC Timeout",
-			description: "Default timeout for irc wait (and send await:true) in milliseconds; 0 disables the timeout",
+			description:
+				"Default timeout for hub message waits (and send await:true) in milliseconds; 0 disables the timeout",
 			options: [
 				{ value: "0", label: "Disabled" },
 				{ value: "30000", label: "30 seconds" },
@@ -3781,29 +4144,49 @@ export const SETTINGS_SCHEMA = {
 		default: 60_000,
 	},
 
-	// Tool Discovery
-	"tools.discoveryMode": {
-		type: "enum",
-		values: ["auto", "off", "mcp-only", "all"] as const,
-		default: "auto",
+	"tools.xdev": {
+		type: "boolean",
+		default: true,
 		ui: {
 			tab: "tools",
 			group: "Discovery & MCP",
-			label: "Tool Discovery",
+			label: "xd:// Tools",
 			description:
-				"Hide tools behind a search tool to save tokens. 'auto' hides MCP tools once the tool set has more than 40 tools; 'mcp-only' always hides MCP tools; 'all' hides all non-essential built-ins too.",
+				"Mount rarely-used (discoverable) tools under xd:// device URLs driven via read/write instead of shipping their schemas on every request. Disable to expose every enabled tool top-level.",
 		},
 	},
 
-	"tools.essentialOverride": {
-		type: "array",
-		default: [] as string[],
+	"tools.xdevDocs": {
+		type: "enum",
+		values: ["inline", "builtins", "catalog"] as const,
+		default: "builtins",
 		ui: {
 			tab: "tools",
 			group: "Discovery & MCP",
-			label: "Essential Tools Override",
+			label: "xd:// Prompt Docs",
 			description:
-				"Override the always-loaded built-in tools (default: read, bash, edit, write, glob, eval). Leave empty to use defaults.",
+				"Choose which mounted-device docs and schemas are inlined in the system prompt. Built-ins keeps core tools inline while MCP and extension tools stay on-demand.",
+			options: [
+				{ value: "inline", label: "All Devices", description: "Inline docs and schemas for every mounted device." },
+				{
+					value: "builtins",
+					label: "Built-ins Only",
+					description: "Inline built-in docs; fetch MCP and extension docs on demand.",
+				},
+				{ value: "catalog", label: "Catalog Only", description: "List every device; fetch all docs on demand." },
+			],
+		},
+	},
+
+	"tools.xdevInlineDevices": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "tools",
+			group: "Discovery & MCP",
+			label: "xd:// Inline Devices",
+			description:
+				"When xd:// Prompt Docs is Built-ins Only, inline dynamic devices whose names match these glob patterns (for example mcp__context_mode_*). Catalog Only ignores this setting.",
 		},
 	},
 
@@ -3819,25 +4202,14 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"mcp.discoveryMode": {
+	"mcp.renderMarkdownResults": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "tools",
 			group: "Discovery & MCP",
-			label: "MCP Tool Discovery",
-			description: "Hide MCP tools by default and expose them through a tool discovery tool",
-		},
-	},
-
-	"mcp.discoveryDefaultServers": {
-		type: "array",
-		default: [] as string[],
-		ui: {
-			tab: "tools",
-			group: "Discovery & MCP",
-			label: "MCP Discovery Default Servers",
-			description: "Keep MCP tools from these servers visible while discovery mode hides other MCP tools",
+			label: "MCP Markdown Results",
+			description: "Render non-JSON MCP text results as Markdown in the transcript",
 		},
 	},
 
@@ -3985,6 +4357,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.isolation.apply": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Isolation",
+			label: "Apply Isolated Changes",
+			description:
+				"Automatically apply successful isolated task changes to the parent checkout; disable to retain patch or branch artifacts",
+		},
+	},
+
 	"task.isolation.merge": {
 		type: "enum",
 		values: ["patch", "branch"] as const,
@@ -4054,7 +4438,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Subagents",
 			label: "Batch Task Calls",
 			description:
-				"Switch the task tool to its batch shape: one call carries { agent, context, tasks[] } — one subagent per item (with per-item isolation) and a required shared context prepended to every assignment. With async.enabled=true, each spawn runs as an independent background agent with the normal idle/parked lifecycle; otherwise the call blocks for merged results. Disable to restore the flat single-spawn schema.",
+				"Switch the task tool to its batch shape: one call carries { context, tasks[] } — one subagent per item, with an optional per-item agent (defaulting to the session spawn-policy agent), per-item isolation, and a required shared context prepended to every assignment. With async.enabled=true, each spawn runs as an independent background agent with the normal idle/parked lifecycle; otherwise the call blocks for merged results. Disable to restore the flat single-spawn schema.",
 		},
 	},
 
@@ -4142,31 +4526,31 @@ export const SETTINGS_SCHEMA = {
 
 	"task.softRequestBudget": {
 		type: "number",
-		default: 90,
+		default: 200,
 		ui: {
 			tab: "tasks",
 			group: "Subagents",
 			label: "Soft Subagent Request Budget",
 			description:
-				"Soft per-subagent request budget (assistant requests per run). Crossing it can inject a steering notice when task.softRequestBudgetNotice is enabled; at 1.5x the budget the run is aborted gracefully, salvaging partial output. 0 disables the guard. Bundled explore/sonic agents use a lower built-in budget.",
+				"Soft per-subagent request budget (assistant requests per run). Crossing it injects a wrap-up steering notice (see task.softRequestBudgetNotice); at 1.5x the budget the run is force-stopped and the agent must yield its partial findings. 0 disables the guard. Bundled scout/sonic agents use a lower built-in budget.",
 			options: [
 				{ value: "0", label: "Disabled" },
-				{ value: "40", label: "40 requests" },
-				{ value: "90", label: "90 requests", description: "Default" },
+				{ value: "90", label: "90 requests" },
 				{ value: "150", label: "150 requests" },
+				{ value: "200", label: "200 requests", description: "Default" },
 			],
 		},
 	},
 
 	"task.softRequestBudgetNotice": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "tasks",
 			group: "Subagents",
 			label: "Soft Request Budget Notice",
 			description:
-				"Inject one steering notice when a subagent crosses its soft request budget. Off by default; enabling it asks the child to wrap up before the 1.5x graceful abort guard.",
+				"Inject one steering notice when a subagent crosses its soft request budget, asking it to wrap up before the 1.5x forced-yield stop.",
 		},
 	},
 
@@ -4178,6 +4562,21 @@ export const SETTINGS_SCHEMA = {
 	"task.agentModelOverrides": {
 		type: "record",
 		default: {} as Record<string, string>,
+	},
+	"task.agentPrewalk": {
+		type: "record",
+		default: {} as Record<string, string>,
+	},
+	"task.prewalk": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Generic Task Prewalk",
+			description:
+				"Arm prewalk for the bundled generic `task` subagent: it starts on its resolved model, plans and begins the implementation, then hands off to the 'smol' role at its first edit/write. Per-agent overrides (task.agentPrewalk, toggled with P in /agents) and user agent `prewalk` frontmatter apply regardless of this toggle.",
+		},
 	},
 
 	"tasks.todoClearDelay": {
@@ -4302,7 +4701,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "providers",
 			group: "Privacy",
 			label: "Hide Secrets",
-			description: "Obfuscate secrets before sending to AI providers",
+			description: "Obfuscate configured secrets and redact credential-shaped tokens before sending to AI providers",
 		},
 	},
 
@@ -4318,16 +4717,17 @@ export const SETTINGS_SCHEMA = {
 				"Maximum concurrent Ollama Cloud subagent runs per process; 0 disables the provider-specific limit",
 		},
 	},
-	"providers.webSearch": {
-		type: "enum",
-		values: SEARCH_PROVIDER_PREFERENCES,
-		default: "auto",
+	"providers.webSearchOrder": {
+		type: "array",
+		default: [] as SearchProviderId[],
 		ui: {
 			tab: "providers",
 			group: "Services",
-			label: "Web Search Provider",
-			description: "Preferred provider for the web_search tool",
-			options: SEARCH_PROVIDER_OPTIONS,
+			label: "Web Search Provider Order",
+			description:
+				"Prioritized providers for the web_search tool; unlisted providers retain their default order afterward",
+			options: SEARCH_PROVIDER_CHOICES,
+			ordered: true,
 		},
 	},
 	"providers.webSearchExclude": {
@@ -4338,6 +4738,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Services",
 			label: "Excluded Web Search Providers",
 			description: "Providers that web_search should never use, even as fallbacks",
+			options: SEARCH_PROVIDER_CHOICES,
 		},
 	},
 	"providers.webSearchGeminiModel": {
@@ -4378,35 +4779,17 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
-	"providers.image": {
-		type: "enum",
-		values: ["auto", "openai", "antigravity", "xai", "gemini", "openrouter"] as const,
-		default: "auto",
+	"providers.imageOrder": {
+		type: "array",
+		default: [] as ImageProvider[],
 		ui: {
 			tab: "providers",
 			group: "Services",
-			label: "Image Provider",
-			description: "Preferred provider for image generation",
-			options: [
-				{
-					value: "auto",
-					label: "Auto",
-					description: "Priority: GPT model image tool > Antigravity > xAI > OpenRouter > Gemini",
-				},
-				{ value: "openai", label: "OpenAI", description: "Uses the active GPT Responses/Codex model" },
-				{
-					value: "antigravity",
-					label: "Antigravity",
-					description: "Requires google-antigravity OAuth",
-				},
-				{
-					value: "xai",
-					label: "xAI Grok Imagine",
-					description: "Requires xAI Grok OAuth or XAI_API_KEY",
-				},
-				{ value: "gemini", label: "Gemini", description: "Requires GEMINI_API_KEY" },
-				{ value: "openrouter", label: "OpenRouter", description: "Requires OPENROUTER_API_KEY" },
-			],
+			label: "Image Provider Order",
+			description:
+				"Prioritized providers for image generation; unlisted providers follow the active session provider and the built-in order",
+			options: IMAGE_PROVIDER_CHOICES,
+			ordered: true,
 		},
 	},
 	"providers.fireworksTier": {
@@ -4536,7 +4919,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Tiny Model",
 			label: "Tiny Model",
 			description:
-				"Session-title model: online (the TINY role from /models, else pi/smol) by default, or a local on-device model",
+				"Session-title model: online (the TINY role from /models, else @smol) by default, or a local on-device model",
 			options: TINY_TITLE_MODEL_OPTIONS,
 		},
 	},
@@ -4623,14 +5006,15 @@ export const SETTINGS_SCHEMA = {
 
 	"providers.kimiApiFormat": {
 		type: "enum",
-		values: ["openai", "anthropic"] as const,
-		default: "anthropic",
+		values: ["auto", "openai", "anthropic"] as const,
+		default: "auto",
 		ui: {
 			tab: "providers",
 			group: "Protocol",
 			label: "Kimi API Format",
-			description: "API format for Kimi Code provider",
+			description: "API format for Kimi Code provider (auto follows live model metadata)",
 			options: [
+				{ value: "auto", label: "Auto", description: "Use the model's server-declared protocol" },
 				{ value: "openai", label: "OpenAI", description: "api.kimi.com" },
 				{ value: "anthropic", label: "Anthropic", description: "api.moonshot.ai" },
 			],
@@ -4882,6 +5266,11 @@ export const SETTINGS_SCHEMA = {
 		default: undefined,
 	},
 
+	"searxng.engines": {
+		type: "string",
+		default: undefined,
+	},
+
 	"searxng.language": {
 		type: "string",
 		default: undefined,
@@ -4901,12 +5290,13 @@ export const SETTINGS_SCHEMA = {
 
 	"dev.autoqa": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "tools",
 			group: "Developer",
 			label: "Auto QA",
-			description: "Enable automated tool issue reporting (report_tool_issue) for all agents",
+			description:
+				"Automated tool issue reporting (xd://report_issue). On by default; the first report asks for consent, and denying it disables reporting until re-enabled explicitly",
 		},
 	},
 
@@ -4936,8 +5326,10 @@ export const SETTINGS_SCHEMA = {
 	 *
 	 * Owned by `packages/coding-agent/src/tools/report-tool-issue.ts` via the
 	 * process-global consent handler registered by `InteractiveMode`.
+	 *
+	 * @default "unset"
 	 */
-	"dev.autoqa.consent": {
+	"dev.autoqaConsent": {
 		type: "enum",
 		values: ["unset", "granted", "denied"] as const,
 		default: "unset" as const,
@@ -4964,6 +5356,8 @@ export const SETTINGS_SCHEMA = {
 	"thinkingBudgets.high": { type: "number", default: 16384 },
 
 	"thinkingBudgets.xhigh": { type: "number", default: 32768 },
+
+	"thinkingBudgets.max": { type: "number", default: 32768 },
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5090,6 +5484,9 @@ export interface RetrySettings {
 	baseDelayMs: number;
 	maxDelayMs: number;
 	modelFallback: boolean;
+	usageAwareFallback: boolean;
+	usageReservePct: number;
+	usageReservePolicy: "confirm" | "auto" | "fail-closed";
 }
 
 export interface MemoriesSettings {
@@ -5180,6 +5577,7 @@ export interface ThinkingBudgetsSettings {
 	medium: number;
 	high: number;
 	xhigh: number;
+	max: number;
 }
 
 export interface SttSettings {

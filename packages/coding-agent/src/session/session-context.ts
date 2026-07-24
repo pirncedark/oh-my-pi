@@ -5,6 +5,7 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	INTERRUPTED_THINKING_MESSAGE_TYPE,
 	isCustomMessageContent,
 	normalizeCustomMessagePayload,
 } from "./messages";
@@ -17,6 +18,8 @@ import { type CompactionEntry, EPHEMERAL_MODEL_CHANGE_ROLE, type SessionEntry } 
 const LEGACY_SNAPCOMPACT_FRAME_COUNT_GUARD = 16;
 const LEGACY_SNAPCOMPACT_ARCHIVE_TEXT_GUARD = 250_000;
 const LEGACY_SNAPCOMPACT_TRUNCATED_CHARS_GUARD = 1_000_000;
+const SUPERSEDED_COMPACTION_SUMMARY = "[Superseded compaction summary elided after a newer compaction]";
+const SUPERSEDED_COMPACTION_SHORT_SUMMARY = "Superseded compaction elided";
 
 function hasLegacySnapcompactFrames(archive: snapcompact.Archive): boolean {
 	return archive.frames.some(frame => frame.font === undefined && frame.variant === undefined);
@@ -64,10 +67,6 @@ export interface SessionContext {
 	models: Record<string, string>;
 	/** Names of TTSR rules that have been injected this session */
 	injectedTtsrRules: string[];
-	/** MCP tool names selected through discovery for this session branch. */
-	selectedMCPToolNames: string[];
-	/** Whether this branch contains an explicit persisted MCP selection entry. */
-	hasPersistedMCPToolSelection: boolean;
 	/** Active mode (e.g. "plan") or "none" if no special mode is active */
 	mode: string;
 	/** Mode-specific data from the last mode_change entry */
@@ -120,6 +119,25 @@ export interface BuildSessionContextOptions {
 	transcript?: boolean;
 	/** In transcript mode, elide entries replaced by the latest compaction. */
 	collapseCompactedHistory?: boolean;
+	/**
+	 * Transcript mode only: keep `toolCall` blocks that have no matching
+	 * `toolResult` on the path instead of stripping them. Pass this when the
+	 * session is mid-turn (a tool is still executing, its result not yet
+	 * persisted) so the rebuilt transcript renders the in-flight call as
+	 * pending; without it a focus/unfocus or overlay-close rebuild silently
+	 * hides the call the agent is still waiting on.
+	 */
+	keepDanglingToolCalls?: boolean;
+}
+
+/**
+ * Display-only marker set on transcript assistant messages whose dangling
+ * `toolCall` blocks were stripped (no paired result on the resolved path —
+ * failed/retried turns, results on sibling branches). The TUI renders a
+ * placeholder row from it so the turn's activity never silently vanishes.
+ */
+export interface StrippedToolCallsMarker {
+	strippedToolCalls?: number;
 }
 
 /**
@@ -132,6 +150,7 @@ function snapcompactHistoryBlocksForContext(
 	options: BuildSessionContextOptions | undefined,
 ) {
 	if (!archive) return undefined;
+	if (options?.transcript && options.collapseCompactedHistory) return undefined;
 	return snapcompact.historyBlocks(archive, snapcompactHistoryBlockOptions(archive, options));
 }
 
@@ -159,8 +178,6 @@ export function buildSessionContext(
 			serviceTier: undefined,
 			models: {},
 			injectedTtsrRules: [],
-			selectedMCPToolNames: [],
-			hasPersistedMCPToolSelection: false,
 			mode: "none",
 		};
 	}
@@ -179,16 +196,17 @@ export function buildSessionContext(
 			serviceTier: undefined,
 			models: {},
 			injectedTtsrRules: [],
-			selectedMCPToolNames: [],
-			hasPersistedMCPToolSelection: false,
 			mode: "none",
 		};
 	}
 
-	// Walk from leaf to root, collecting path
+	// Walk from leaf to root, collecting path. Corrupt/pre-fix files can contain
+	// parent cycles; stop at the first repeat so session load is bounded.
 	const path: SessionEntry[] = [];
+	const seenPathIds = new Set<string>();
 	let current: SessionEntry | undefined = leaf;
-	while (current) {
+	while (current && !seenPathIds.has(current.id)) {
+		seenPathIds.add(current.id);
 		path.push(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
@@ -201,8 +219,6 @@ export function buildSessionContext(
 	const models: Record<string, string> = {};
 	let compaction: CompactionEntry | null = null;
 	const injectedTtsrRulesSet = new Set<string>();
-	let selectedMCPToolNames: string[] = [];
-	let hasPersistedMCPToolSelection = false;
 	let mode = "none";
 	let modeData: Record<string, unknown> | undefined;
 	// Track whether an explicit `model_change` with role="default" has been
@@ -245,9 +261,6 @@ export function buildSessionContext(
 			for (const ruleName of entry.injectedRules) {
 				injectedTtsrRulesSet.add(ruleName);
 			}
-		} else if (entry.type === "mcp_tool_selection") {
-			selectedMCPToolNames = [...entry.selectedToolNames];
-			hasPersistedMCPToolSelection = true;
 		} else if (entry.type === "mode_change") {
 			mode = entry.mode;
 			modeData = entry.data;
@@ -333,16 +346,18 @@ export function buildSessionContext(
 		for (const entry of path) {
 			handleEntryResetTracking(entry);
 			if (entry.type === "compaction") {
-				const snapcompactArchive = snapcompact.getPreservedArchive(entry.preserveData);
+				const active = entry.id === compaction?.id;
+				const snapcompactArchive = active ? snapcompact.getPreservedArchive(entry.preserveData) : undefined;
 				pushMessage(
 					createCompactionSummaryMessage(
-						entry.summary,
+						active ? entry.summary : SUPERSEDED_COMPACTION_SUMMARY,
 						entry.tokensBefore,
 						entry.timestamp,
-						entry.shortSummary,
+						active ? entry.shortSummary : SUPERSEDED_COMPACTION_SHORT_SUMMARY,
 						undefined,
 						undefined,
 						snapcompactHistoryBlocksForContext(snapcompactArchive, options),
+						entry.warning,
 					),
 				);
 			} else {
@@ -375,6 +390,7 @@ export function buildSessionContext(
 			providerPayload,
 			undefined,
 			snapcompactHistoryBlocksForContext(snapcompactArchive, options),
+			compaction.warning,
 		);
 		// Agent context (non-transcript): summary first so the LLM sees the
 		// compacted context before recent messages.
@@ -445,34 +461,82 @@ export function buildSessionContext(
 	// plaintext to keep) and clear `thinking` signatures so the provider encoder
 	// downgrades them to plain text (verified accepted by the live API), preserving the
 	// visible reasoning while removing the immutability/invalid-signature hazard. Drop a
-	// turn left with no content. (Live turns never qualify: their results are persisted
-	// on the same path before any context rebuild.)
-	const pairedToolResultIds = new Set<string>();
-	for (const message of messages) {
-		if (message.role === "toolResult") pairedToolResultIds.add(message.toolCallId);
-	}
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (message.role !== "assistant") continue;
-		const hasDangling = message.content.some(
-			block => block.type === "toolCall" && !pairedToolResultIds.has(block.id),
-		);
-		if (!hasDangling) continue;
-		const normalized = message.content
-			.filter(
-				block =>
-					!(block.type === "toolCall" && !pairedToolResultIds.has(block.id)) && block.type !== "redactedThinking",
-			)
-			.map(block =>
-				block.type === "thinking" && block.thinkingSignature ? { ...block, thinkingSignature: undefined } : block,
-			);
-		if (normalized.length === 0) {
-			messages.splice(i, 1);
-			if (options?.transcript) {
-				cacheMissExplainedAt.splice(i, 1);
+	// turn left with no content. (Live turns only qualify mid-turn: a transcript rebuild
+	// while the tool still executes sees the persisted assistant turn without its result.
+	// Those callers pass `keepDanglingToolCalls` so the in-flight call stays visible as
+	// a pending block instead of vanishing from the chat.)
+	const keepDangling = options?.transcript === true && options.keepDanglingToolCalls === true;
+	if (!keepDangling) {
+		const pairedToolResultIds = new Set<string>();
+		for (const message of messages) {
+			if (message.role === "toolResult") pairedToolResultIds.add(message.toolCallId);
+		}
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i];
+			if (message.role !== "assistant") continue;
+			let strippedToolCalls = 0;
+			for (const block of message.content) {
+				if (block.type === "toolCall" && !pairedToolResultIds.has(block.id)) strippedToolCalls++;
 			}
-		} else {
-			messages[i] = { ...message, content: normalized };
+			if (strippedToolCalls === 0) continue;
+			const normalized = message.content
+				.filter(
+					block =>
+						!(block.type === "toolCall" && !pairedToolResultIds.has(block.id)) &&
+						block.type !== "redactedThinking",
+				)
+				.map(block =>
+					block.type === "thinking" && block.thinkingSignature
+						? { ...block, thinkingSignature: undefined }
+						: block,
+				);
+			if (normalized.length === 0 && !options?.transcript) {
+				messages.splice(i, 1);
+			} else {
+				const rewritten = { ...message, content: normalized };
+				if (options?.transcript) {
+					// Display transcript: keep the turn (even content-less) and mark
+					// how many calls were dropped so the TUI renders a placeholder
+					// row instead of silently erasing the turn's activity.
+					(rewritten as AgentMessage & StrippedToolCallsMarker).strippedToolCalls = strippedToolCalls;
+				}
+				messages[i] = rewritten;
+			}
+		}
+	}
+
+	// Error/abort assistant turns are transcript events, not safe assistant
+	// turns to replay into the next provider request. Drop them even when a
+	// later user message follows through non-context entries (`session_exit`,
+	// labels, etc.); otherwise a resumed session replays a dead partial turn
+	// and can spend minutes reprocessing old context before the new prompt.
+	// Keep the interrupted-thinking continuity pair: convertToLlm strips the
+	// unsafe trailing thinking from that assistant and sends the hidden
+	// continuity note instead.
+	if (!options?.transcript) {
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i];
+			if (message?.role !== "assistant") continue;
+			if (message.stopReason !== "aborted" && message.stopReason !== "error") continue;
+			const next = messages[i + 1];
+			if (next?.role === "custom" && next.customType === INTERRUPTED_THINKING_MESSAGE_TYPE) continue;
+			// A failed turn that emitted tool calls persists paired synthetic
+			// tool_result placeholders after it. Dropping only the assistant would
+			// strand those results with no preceding tool_use — a shape providers
+			// reject — so remove the paired results alongside the turn.
+			const droppedToolCallIds = new Set<string>();
+			for (const block of message.content) {
+				if (block.type === "toolCall") droppedToolCallIds.add(block.id);
+			}
+			messages.splice(i, 1);
+			if (droppedToolCallIds.size > 0) {
+				for (let j = messages.length - 1; j >= i; j--) {
+					const candidate = messages[j];
+					if (candidate?.role === "toolResult" && droppedToolCallIds.has(candidate.toolCallId)) {
+						messages.splice(j, 1);
+					}
+				}
+			}
 		}
 	}
 
@@ -484,8 +548,6 @@ export function buildSessionContext(
 		serviceTier,
 		models,
 		injectedTtsrRules,
-		selectedMCPToolNames,
-		hasPersistedMCPToolSelection,
 		mode,
 		modeData,
 	};

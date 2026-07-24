@@ -2,6 +2,112 @@
 
 ## [Unreleased]
 
+## [17.1.2] - 2026-07-24
+
+### Fixed
+
+- Fixed native addon builds with CMake 4.x (bundled opus policy floor) and stopped passing `-C target-cpu=native` on darwin arm64, which baked build-host CPU features into shipped addons and broke `ring` compilation.
+
+## [17.1.1] - 2026-07-24
+
+### Added
+
+- Added native `AudioCapture`, `AudioPlayback`, and `LiveWebRtcPeer` classes for low-latency microphone capture, gapless speaker playback, and WebRTC offer/answer sessions with Opus media and `oai-events` data-channel delivery.
+- Added a macOS `deviceCheckGenerateToken` export that generates Apple DeviceCheck attestation tokens natively: it drives `DCDevice.generateToken` through raw Objective-C runtime FFI with a hand-built completion block literal and a bounded one-second wait, resolving `{ supported, tokenBase64, error, latencyMs }` to mirror the ChatGPT desktop app's `devicecheck.node` addon contract. Non-macOS builds resolve `supported: false` without touching the network.
+- Added a genuine native desktop backend for computer use, bundled in the core addon on every published platform: macOS Quartz/CGEvent, Windows Win32/`SendInput`, and a pure-Rust Linux X11 backend (`x11rb` capture over the display socket, XTest input with keysym mapping) that links no GUI system libraries — so Linux x64/arm64, glibc and musl are all supported and headless hosts are unaffected. Wayland sessions work through XWayland. Execute batches enforce a 60-second native deadline (`DESKTOP_DEADLINE_EXCEEDED`) and never emit input after it expires; unsupported pure-Wayland capture and out-of-XTest-range or negative-origin coordinate layouts fail closed.
+
+### Fixed
+
+- Fixed macOS computer screenshots taking roughly 30 seconds under Bun by replacing xcap's deprecated window-list capture with a bounded system capture path; direct screenshots now complete in under half a second on the verified host.
+
+## [17.0.8] - 2026-07-22
+
+### Added
+
+- Added jsdiff-compatible native diff exports: `diffLines`, `diffWords`, `diffLineRuns`, and `structuredPatchHunks`.
+- Added batch vector kernels for mnemopi recall paths: `cosineSimilarityPairs`, `vectorIndexTopK`, and `mmrRerankIndices`.
+
+### Changed
+
+- Updated diff functions (`diffLines`, `diffWords`, `diffLineRuns`, `structuredPatchHunks`) to process UTF-16 code units natively end to end via `Utf16String`, supporting ill-formed JS strings with unpaired surrogates without throwing or converting to UTF-8.
+
+### Fixed
+
+- Fixed a critical issue where the in-process `rm` builtin treated an empty path operand as the current working directory, causing `rm -rf ""` to recursively delete the current directory. Empty operands are now rejected, matching GNU `rm` behavior.
+
+### Removed
+
+- Removed unused `similar` crate dependency and dev-dependency on npm `diff`.
+
+## [17.0.5] - 2026-07-18
+
+### Added
+
+- Added optional PTY start callbacks that report the spawned child PID before command completion.
+
+## [17.0.3] - 2026-07-17
+
+### Fixed
+
+- Fixed `~` (tilde) not expanding for every element of a brace expansion in the bash tool, so `mkdir -p ~/project/{a,b}` now creates both `a` and `b` under `$HOME/project` instead of leaving a literal `~/project/b` in the working directory ([#5819](https://github.com/can1357/oh-my-pi/issues/5819)).
+- Fixed ANSI text wrapping to close and restore OSC 8 hyperlinks at physical line boundaries, preventing link targets from leaking into appended content ([#5885](https://github.com/can1357/oh-my-pi/issues/5885)).
+
+## [17.0.2] - 2026-07-17
+
+### Fixed
+
+- Fixed an issue where running `uv run --extra <package> pytest` bypassed native pytest minimization due to a wrapper parsing error.
+- Fixed a bug where timed-out shell pipelines dropped captured output and could cause Windows hosts to terminate during teardown. (#5316)
+
+## [17.0.1] - 2026-07-16
+
+### Fixed
+
+- Fixed the pi-natives version sentinel emitting "reinstall to re-sync" when a long-lived process survives an in-place upgrade: the loader now detects that the resident addon exposes a *prior* release's sentinel and reports "omp was upgraded while this session was running — restart to pick up the new version (disk is already consistent)" instead of misdiagnosing it as a stale on-disk file ([#4812](https://github.com/can1357/oh-my-pi/issues/4812)).
+
+## [17.0.0] - 2026-07-15
+
+### Fixed
+
+- Fixed the in-process grep builtin to correctly handle escaped alternation (\|) in default and -G (GNU basic-regex) searches, while preserving the correct regex dialects for -E, -F, and -P.
+
+## [16.5.2] - 2026-07-14
+
+### Fixed
+
+- Fixed an issue where Windows PTY callers were forced through shell command re-quoting by supporting direct executable and argument launching.
+
+## [16.4.6] - 2026-07-12
+
+### Added
+
+- Added an in-process `readlink` shell builtin (vendored from uutils coreutils 0.8.0), supporting `-f`/`-e`/`-m` canonicalization, `-n`/`-z` delimiters, and `-v`/`-q`/`-s` verbosity, with path operands resolved against the shell working directory.
+- Added in-process shell builtins for `realpath`, `touch`, `stat`, `date`, `mktemp`, `seq`, `yes`, `printenv`, `ln`, `truncate`, `tac`, `nproc`, `uname`, `whoami`, and `hostname` (vendored from uutils coreutils 0.8.0), plus native `which` (shell PATH lookup) and `diff` (unified output, `-U`/`-q`/`-N`, binary detection, recursive directory compare) builtins. All resolve path operands against the shell working directory, read the shell's exported environment, and honor abort/timeout cancellation; `ln` is gated with the destructive set (`PI_DISABLE_UUTILS_DESTRUCTIVE`), and system-mutating modes (`date --set`, hostname setting) are disabled.
+
+### Fixed
+
+- Fixed `ast_edit` rejecting byte-identical duplicate replacements as "Overlapping replacements detected": multiple rewrite ops matching the same node with the same output now collapse into one deterministic edit (deduped in both the preview listing/counts and the apply pass), so only genuinely divergent overlaps error.
+
+## [16.4.5] - 2026-07-11
+
+### Added
+
+- Added context-safe, in-process shell builtins for common utilities including base64, basename, dirname, cut, tee, tr, paste, comm, sed, xargs, jq, and the md5sum/sha/b2sum checksum family. These builtins run without spawning external binaries, support pipelines, respect shell-relative paths and environment variables, and honor abort/timeout cancellation.
+
+## [16.4.4] - 2026-07-11
+
+### Fixed
+
+- Fixed fuzzyFind tie-breaking logic to prefer shallower paths first, preventing deeply nested matches from ranking above shallow ones on score ties.
+- Fixed macOS installation issues for pi-natives by statically linking PCRE2, removing the runtime dependency on Homebrew's dynamic libpcre2-8.0.dylib library.
+
+## [16.4.3] - 2026-07-11
+
+### Fixed
+
+- Optimized non-recursive glob patterns (e.g., `dir/*.json`) to prevent traversing entire subtrees, significantly improving performance and preventing timeouts when searching large directories.
+- Fixed native filesystem searches (`glob`, `grep`, and AST search/edit) incorrectly excluding explicitly rooted directories due to ancestor ignore rules.
+
 ## [16.3.13] - 2026-07-09
 
 ### Fixed

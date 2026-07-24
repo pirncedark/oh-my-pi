@@ -6,13 +6,30 @@
  */
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
+import { withTimeoutSignal } from "../utils/fetch-timeout";
+
+/** Per-request abort deadline for each OAuth discovery metadata fetch. */
+const DISCOVERY_FETCH_TIMEOUT_MS = 10_000;
 
 export interface OAuthEndpoints {
 	authorizationUrl: string;
 	tokenUrl: string;
 	clientId?: string;
+	/** Dynamic client registration endpoint advertised by the authorization server. */
+	registrationUrl?: string;
 	scopes?: string;
 	resource?: string;
+}
+
+function readRegistrationUrl(metadata: Record<string, unknown>): string | undefined {
+	const value =
+		metadata.registration_endpoint ??
+		metadata.registrationEndpoint ??
+		metadata.registration_url ??
+		metadata.registrationUrl ??
+		metadata.registration_uri ??
+		metadata.registrationUri;
+	return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
 export interface AuthDetectionResult {
@@ -102,7 +119,7 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 			(obj.resource_uri as string | undefined) ||
 			(obj.resourceUri as string | undefined);
 
-		return { authorizationUrl, tokenUrl, clientId, scopes, resource };
+		return { authorizationUrl, tokenUrl, registrationUrl: readRegistrationUrl(obj), clientId, scopes, resource };
 	};
 
 	const clientIdFromAuthUrl = (authorizationUrl: string): string | undefined => {
@@ -175,6 +192,10 @@ export function extractOAuthEndpoints(error: Error): OAuthEndpoints | null {
 			return {
 				authorizationUrl,
 				tokenUrl,
+				registrationUrl:
+					challengeValues.get("registration_endpoint") ||
+					challengeValues.get("registration_url") ||
+					challengeValues.get("registration_uri"),
 				clientId: challengeValues.get("client_id") || clientIdFromAuthUrl(authorizationUrl),
 				scopes: challengeValues.get("scope") || challengeValues.get("scopes") || scopeFromAuthUrl(authorizationUrl),
 				resource,
@@ -329,7 +350,7 @@ function readMetadataScopes(metadata: Record<string, unknown>): string | undefin
  */
 export async function fetchResourceMetadataScopes(
 	resourceMetadataUrl: string,
-	opts?: { fetch?: FetchImpl },
+	opts?: { fetch?: FetchImpl; signal?: AbortSignal },
 ): Promise<string | undefined> {
 	const fetchImpl: FetchImpl = opts?.fetch ?? fetch;
 	try {
@@ -337,6 +358,7 @@ export async function fetchResourceMetadataScopes(
 			method: "GET",
 			headers: { Accept: "application/json" },
 			redirect: "follow",
+			signal: withTimeoutSignal(DISCOVERY_FETCH_TIMEOUT_MS, opts?.signal),
 		});
 		if (!resp.ok) return undefined;
 		const meta = (await resp.json()) as Record<string, unknown>;
@@ -354,7 +376,7 @@ export async function discoverOAuthEndpoints(
 	serverUrl: string,
 	authServerUrl?: string,
 	resourceMetadataUrl?: string,
-	opts?: { fetch?: FetchImpl; protectedResource?: string; protectedScopes?: string },
+	opts?: { fetch?: FetchImpl; protectedResource?: string; protectedScopes?: string; signal?: AbortSignal },
 ): Promise<OAuthEndpoints | null> {
 	const fetchImpl: FetchImpl = opts?.fetch ?? fetch;
 	const wellKnownPaths = [
@@ -385,6 +407,7 @@ export async function discoverOAuthEndpoints(
 				method: "GET",
 				headers: { Accept: "application/json" },
 				redirect: "follow",
+				signal: withTimeoutSignal(DISCOVERY_FETCH_TIMEOUT_MS, opts?.signal),
 			});
 			if (metaResp.ok) {
 				const meta = (await metaResp.json()) as Record<string, unknown>;
@@ -415,6 +438,7 @@ export async function discoverOAuthEndpoints(
 			return {
 				authorizationUrl: String(metadata.authorization_endpoint),
 				tokenUrl: String(metadata.token_endpoint),
+				registrationUrl: readRegistrationUrl(metadata),
 				clientId:
 					typeof metadata.client_id === "string"
 						? metadata.client_id
@@ -438,6 +462,7 @@ export async function discoverOAuthEndpoints(
 				return {
 					authorizationUrl: oauthData.authorization_url || String(oauthData.authorizationUrl),
 					tokenUrl: oauthData.token_url || String(oauthData.tokenUrl),
+					registrationUrl: readRegistrationUrl(oauthData),
 					clientId:
 						typeof oauthData.client_id === "string"
 							? oauthData.client_id
@@ -467,6 +492,7 @@ export async function discoverOAuthEndpoints(
 						method: "GET",
 						headers: { Accept: "application/json" },
 						redirect: "follow",
+						signal: withTimeoutSignal(DISCOVERY_FETCH_TIMEOUT_MS, opts?.signal),
 					});
 
 					if (response.ok) {
@@ -502,6 +528,7 @@ export async function discoverOAuthEndpoints(
 									fetch: fetchImpl,
 									protectedResource: discoveredProtectedResource,
 									protectedScopes: readMetadataScopes(metadata) ?? protectedScopes,
+									signal: opts?.signal,
 								});
 								if (discovered) return discovered;
 							}

@@ -16,21 +16,21 @@ import { astEditToolRenderer } from "./ast-edit";
 import { astGrepToolRenderer } from "./ast-grep";
 import { bashToolRenderer } from "./bash";
 import { browserToolRenderer } from "./browser/render";
+import { computerToolRenderer } from "./computer-renderer";
 import { debugToolRenderer } from "./debug";
 import { evalToolRenderer } from "./eval-render";
 import { githubToolRenderer } from "./gh-renderer";
 import { globToolRenderer } from "./glob";
 import { grepToolRenderer } from "./grep";
+import { hubToolRenderer } from "./hub";
 import { inspectImageToolRenderer } from "./inspect-image-renderer";
-import { ircToolRenderer } from "./irc";
-import { jobToolRenderer } from "./job";
 import { recallToolRenderer, reflectToolRenderer, retainToolRenderer } from "./memory-render";
 import { readToolRenderer } from "./read";
-import { resolveToolRenderer } from "./resolve";
-import { searchToolBm25Renderer } from "./search-tool-bm25";
-import { sshToolRenderer } from "./ssh";
+import { resolveRenderer } from "./resolve";
 import { todoToolRenderer } from "./todo";
+import { createVibeToolRenderer } from "./vibe";
 import { writeToolRenderer } from "./write";
+import { setXdevRendererLookup } from "./xdev";
 
 /**
  * Per-renderer opt-in for a full viewport replay when the first result
@@ -83,6 +83,7 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	ast_edit: astEditToolRenderer as ToolRenderer,
 	bash: bashToolRenderer as ToolRenderer,
 	browser: browserToolRenderer as ToolRenderer,
+	computer: computerToolRenderer as ToolRenderer,
 	debug: debugToolRenderer as ToolRenderer,
 	eval: evalToolRenderer as ToolRenderer,
 	edit: editToolRenderer as ToolRenderer,
@@ -91,15 +92,22 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	grep: grepToolRenderer as ToolRenderer,
 	lsp: lspToolRenderer as ToolRenderer,
 	inspect_image: inspectImageToolRenderer as ToolRenderer,
-	irc: ircToolRenderer as ToolRenderer,
+	// Lazy getter: `hubToolRenderer` lives in a module whose deps (messaging →
+	// persisted-agents → vibe/runtime → task/executor → sdk) close an import
+	// cycle back here, so reading it at init order-dependently hits its
+	// temporal dead zone. Deferring the read to first access sidesteps it.
+	get hub(): ToolRenderer {
+		return hubToolRenderer as ToolRenderer;
+	},
 	read: readToolRenderer as ToolRenderer,
-	job: jobToolRenderer as ToolRenderer,
-	resolve: resolveToolRenderer as ToolRenderer,
+	// Keyed by xd:// resolution-device names: the write dispatch delegates here
+	// by dispatch tool, and historical `resolve` tool transcripts still render
+	// through the `resolve` entry. Both devices carry the same ResolveDetails.
+	resolve: resolveRenderer as ToolRenderer,
+	reject: resolveRenderer as ToolRenderer,
 	retain: retainToolRenderer as ToolRenderer,
 	recall: recallToolRenderer as ToolRenderer,
 	reflect: reflectToolRenderer as ToolRenderer,
-	search_tool_bm25: searchToolBm25Renderer as ToolRenderer,
-	ssh: sshToolRenderer as ToolRenderer,
 	// Lazy getter: `taskToolRenderer` lives in a module that closes an import
 	// cycle back here (task/renderer → task/render → … → tools/renderers), so
 	// reading it at init order-dependently hits its temporal dead zone. Deferring
@@ -111,5 +119,15 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	github: githubToolRenderer as ToolRenderer,
 	goal: goalToolRenderer as ToolRenderer,
 	web_search: webSearchToolRenderer as ToolRenderer,
+	vibe_spawn: createVibeToolRenderer("spawn") as ToolRenderer,
+	vibe_send: createVibeToolRenderer("send") as ToolRenderer,
+	vibe_wait: createVibeToolRenderer("wait") as ToolRenderer,
+	vibe_kill: createVibeToolRenderer("kill") as ToolRenderer,
+	vibe_list: createVibeToolRenderer("list") as ToolRenderer,
 	write: writeToolRenderer as ToolRenderer,
 };
+
+// Wire the xd:// render delegation. Injected (instead of the xdev module
+// importing this module) to avoid the renderers → tool modules → sdk →
+// tools/index → xdev import cycle.
+setXdevRendererLookup(name => toolRenderers[name]);

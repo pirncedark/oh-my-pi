@@ -1,5 +1,6 @@
 import { $env } from "@oh-my-pi/pi-utils";
 import type { ResponseInput, ResponseInputItem } from "./providers/openai-responses-wire";
+import { redactSensitiveCredentials } from "./providers/transform-messages";
 import type { CacheRetention, OpenAIResponsesHistoryPayload, ProviderPayload } from "./types";
 
 type OpenAIResponsesReplayItem = ResponseInput[number];
@@ -9,7 +10,9 @@ export { isRecord } from "@oh-my-pi/pi-utils";
 export function normalizeSystemPrompts(systemPrompt: readonly string[] | string | undefined | null): string[] {
 	if (systemPrompt === undefined || systemPrompt === null) return [];
 	const prompts = Array.isArray(systemPrompt) ? systemPrompt : typeof systemPrompt === "string" ? [systemPrompt] : [];
-	return prompts.map(prompt => prompt.toWellFormed()).filter(prompt => prompt.trim().length > 0);
+	return prompts
+		.map(prompt => redactSensitiveCredentials(prompt.toWellFormed()))
+		.filter(prompt => prompt.trim().length > 0);
 }
 
 export function normalizeToolCallId(id: string): string {
@@ -65,10 +68,50 @@ export function truncateResponseItemId(id: string, prefix: string): string {
 	return `${prefix}_${Bun.hash(id).toString(36)}`;
 }
 
-export function sanitizeOpenAIResponsesHistoryItemsForReplay(items: Array<Record<string, unknown>>): ResponseInput {
+interface OpenAIResponsesReplaySanitizeOptions {
+	supportsImageDetailOriginal?: boolean;
+}
+
+/**
+ * Clamp `detail: "original"` only where Responses input_image parts live —
+ * top-level items and `message.content[]`. Avoids a deep tree walk/clone of
+ * every history node on providers that reject native-resolution images.
+ */
+function clampReplayItemImageDetail(
+	item: Record<string, unknown>,
+	supportsImageDetailOriginal: boolean,
+): Record<string, unknown> {
+	if (supportsImageDetailOriginal) return item;
+
+	if (item.type === "input_image" && item.detail === "original") {
+		return { ...item, detail: "auto" };
+	}
+
+	if (item.type !== "message" || !Array.isArray(item.content)) return item;
+
+	let changed = false;
+	const content = item.content.map(part => {
+		if (!part || typeof part !== "object" || Array.isArray(part)) return part;
+		const record = part as Record<string, unknown>;
+		if (record.type !== "input_image" || record.detail !== "original") return part;
+		changed = true;
+		return { ...record, detail: "auto" };
+	});
+	return changed ? { ...item, content } : item;
+}
+
+export function sanitizeOpenAIResponsesHistoryItemsForReplay(
+	items: Array<Record<string, unknown>>,
+	options: OpenAIResponsesReplaySanitizeOptions = {},
+): ResponseInput {
 	const normalizedCallIds = new Map<string, string>();
+	const supportsImageDetailOriginal = options.supportsImageDetailOriginal !== false;
 	return items.flatMap(item => {
-		const sanitized = sanitizeOpenAIResponsesHistoryItemForReplay(item, normalizedCallIds);
+		const sanitized = sanitizeOpenAIResponsesHistoryItemForReplay(
+			item,
+			normalizedCallIds,
+			supportsImageDetailOriginal,
+		);
 		return sanitized ? [sanitized] : [];
 	});
 }
@@ -82,8 +125,9 @@ export function sanitizeOpenAIResponsesHistoryItemsForReplay(items: Array<Record
  */
 export function sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(
 	items: Array<Record<string, unknown>>,
+	options: OpenAIResponsesReplaySanitizeOptions = {},
 ): ResponseInput | undefined {
-	const sanitized = sanitizeOpenAIResponsesHistoryItemsForReplay(items);
+	const sanitized = sanitizeOpenAIResponsesHistoryItemsForReplay(items, options);
 	let hasReplayableAssistantOutput = false;
 
 	for (const item of sanitized) {
@@ -153,18 +197,24 @@ export function sanitizeOpenAIResponsesAssistantFallbackItemsForReplay(items: Re
 function sanitizeOpenAIResponsesHistoryItemForReplay(
 	item: Record<string, unknown>,
 	normalizedCallIds: Map<string, string>,
+	supportsImageDetailOriginal: boolean,
 ): OpenAIResponsesReplayItem | undefined {
 	if (item.type === "item_reference") return undefined;
 	if (item.type === "image_generation_call") return sanitizeOpenAIResponsesImageGenerationCallForReplay(item);
 	if (item.type === "reasoning") return sanitizeOpenAIResponsesReasoningItemForReplay(item);
 
-	// providerPayload stores raw output items; replay strips item ids and keeps only normalized call_id.
+	// Provider payload stores raw output items. Computer calls retain their stable
+	// provider item ID; other replay items strip IDs and normalize call_id.
 	const { id: _id, ...sanitizedItem } = item;
+	if (item.type === "computer_call" && typeof item.id === "string") sanitizedItem.id = item.id;
 	if (typeof item.call_id === "string") {
 		sanitizedItem.call_id = normalizeReplayedResponsesHistoryCallId(item.call_id, normalizedCallIds);
 	}
 
-	return sanitizedItem as unknown as OpenAIResponsesReplayItem;
+	return clampReplayItemImageDetail(
+		sanitizedItem,
+		supportsImageDetailOriginal,
+	) as unknown as OpenAIResponsesReplayItem;
 }
 
 function sanitizeOpenAIResponsesReasoningItemForReplay(item: Record<string, unknown>): OpenAIResponsesReplayItem {
@@ -223,10 +273,8 @@ export function getOpenAIResponsesHistoryPayload(
 	if (providerPayload?.type !== "openaiResponsesHistory" || !Array.isArray(providerPayload.items)) {
 		return undefined;
 	}
-	const payloadProvider = providerPayload.provider ?? fallbackProvider;
-	if (!payloadProvider || payloadProvider !== currentProvider) {
-		return undefined;
-	}
+	const payloadProvider = providerPayload.provider ?? fallbackProvider ?? currentProvider;
+	if (payloadProvider !== currentProvider) return undefined;
 	return { ...providerPayload, provider: payloadProvider };
 }
 
@@ -239,11 +287,16 @@ export function getOpenAIResponsesHistoryItems(
 }
 
 /**
- * Resolve cache retention preference.
- * Defaults to "short" and uses PI_CACHE_RETENTION for backward compatibility.
+ * Resolve cache retention preference: explicit request option first, then the
+ * `PI_CACHE_RETENTION` env override (`long` | `short` | `none`), then the
+ * provider-supplied fallback.
  */
-export function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention {
+export function resolveCacheRetention(
+	cacheRetention?: CacheRetention,
+	fallback: CacheRetention = "short",
+): CacheRetention {
 	if (cacheRetention) return cacheRetention;
-	if ($env.PI_CACHE_RETENTION === "long") return "long";
-	return "short";
+	const env = $env.PI_CACHE_RETENTION;
+	if (env === "long" || env === "short" || env === "none") return env;
+	return fallback;
 }

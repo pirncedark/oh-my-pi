@@ -1,9 +1,12 @@
 import type { AuthStorage } from "@oh-my-pi/pi-ai";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
+import type { QuerySyntax } from "../query";
+import { formatScraperQuery } from "../query";
 import { clampNumResults } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
+import { browserFetch } from "./browser-page";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
 /**
@@ -27,15 +30,6 @@ const RECENCY_TO_DDG_DF: Record<NonNullable<SearchParams["recency"]>, string> = 
 	month: "m",
 	year: "y",
 };
-
-/**
- * Browser-like UA so DDG serves the standard results page instead of the
- * mobile-only or noscript variants. DDG returns HTTP 202 plus an anomaly
- * modal when it suspects automation; we surface that as a clear error so
- * the orchestrator can fall through to the next provider with context.
- */
-const BROWSER_USER_AGENT =
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
 interface ParsedResult {
 	title: string;
@@ -126,42 +120,49 @@ function isAnomalyResponse(html: string): boolean {
 	return html.includes("anomaly-modal") || html.includes("anomaly.js");
 }
 
+/**
+ * Query syntax the DDG HTML frontend parses: quotes, `-`, OR, site:,
+ * filetype:, intitle:, inurl:, intext:. Date bounds (`before:`/`after:`) are
+ * deliberately off — DDG does not parse them, so they are stripped from the
+ * query and enforced by the pipeline's lenient post-filter instead.
+ */
+const DDG_QUERY_SYNTAX: QuerySyntax = {
+	phrases: true,
+	negation: true,
+	or: true,
+	site: true,
+	inUrl: true,
+	inTitle: true,
+	inText: true,
+	filetype: true,
+};
+
 async function callDuckDuckGoHtml(params: SearchParams): Promise<string> {
-	const form = new URLSearchParams({ q: params.query, kl: "us-en" });
+	const form = new URLSearchParams({
+		q: formatScraperQuery(params.query, params.parsedQuery, DDG_QUERY_SYNTAX),
+		kl: "us-en",
+	});
 	const df = params.recency ? RECENCY_TO_DDG_DF[params.recency] : undefined;
 	if (df) form.set("df", df);
 	// Add b: "" parameter as specified in the browser fetch template to match real browser form submission
 	form.set("b", "");
 
-	const response = await (params.fetch ?? fetch)(DUCKDUCKGO_HTML_URL, {
-		method: "POST",
-		body: form.toString(),
-		headers: {
-			Accept:
-				"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-			"Accept-Language": "en,en-US;q=0.9",
-			"Cache-Control": "max-age=0",
-			"Content-Type": "application/x-www-form-urlencoded",
-			Priority: "u=0, i",
-			"Sec-Ch-Ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
-			"Sec-Ch-Ua-Mobile": "?0",
-			"Sec-Ch-Ua-Platform": '"macOS"',
-			"Sec-Fetch-Dest": "document",
-			"Sec-Fetch-Mode": "navigate",
-			"Sec-Fetch-Site": "same-origin",
-			"Sec-Fetch-User": "?1",
-			"Upgrade-Insecure-Requests": "1",
-			"User-Agent": BROWSER_USER_AGENT,
-			Referer: "https://html.duckduckgo.com/",
-		},
+	const page = await browserFetch(DUCKDUCKGO_HTML_URL, {
+		fetch: params.fetch ?? fetch,
 		signal: withHardTimeout(params.signal),
+		referer: "https://html.duckduckgo.com/",
+		init: {
+			method: "POST",
+			body: form.toString(),
+		},
+		headers: { "Content-Type": "application/x-www-form-urlencoded" },
 	});
 
-	const body = await response.text();
-	if (!response.ok && response.status !== 202) {
-		const classified = classifyProviderHttpError("duckduckgo", response.status, body);
+	const body = page.html;
+	if (page.status < 200 || page.status >= 300) {
+		const classified = classifyProviderHttpError("duckduckgo", page.status, body);
 		if (classified) throw classified;
-		throw new SearchProviderError("duckduckgo", `DuckDuckGo HTML error (${response.status})`, response.status);
+		throw new SearchProviderError("duckduckgo", `DuckDuckGo HTML error (${page.status})`, page.status);
 	}
 
 	if (isAnomalyResponse(body)) {

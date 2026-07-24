@@ -130,7 +130,10 @@ function getMessageEntries(sessionManager: SessionManager): SessionMessageEntry[
 
 function getTextContent(message: Message): string | undefined {
 	if (typeof message.content === "string") return message.content;
-	return message.content.find(block => block.type === "text")?.text;
+	for (const block of message.content) {
+		if (block.type === "text") return block.text;
+	}
+	return undefined;
 }
 
 function findPersistedMessageEntry(
@@ -258,7 +261,12 @@ async function createSessionHarness(
 		modelRegistry: sharedModelRegistry,
 		sessionManager,
 		model,
-		settings: Settings.isolated(),
+		// These tests seed bare `{ close }` stubs into `providerSessionState` and
+		// assert reload closes them. The SDK's fire-and-forget Codex websocket
+		// prewarm (models with `preferWebsockets`) would race in and replace the
+		// stub via `getCodexProviderSessionState`, orphaning the spy — disable
+		// websockets since these tests exercise reload semantics, not transport.
+		settings: Settings.isolated({ "providers.openaiWebsockets": "off" }),
 		disableExtensionDiscovery: true,
 		skills: [],
 		contextFiles: [],
@@ -363,7 +371,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 			appendStaleAssistantTurn(sessionManager, assistantText, {
 				api: "openai-codex-responses",
 				provider: "openai-codex",
-				model: "gpt-5.2-codex",
+				model: "gpt-5.5",
 			});
 		});
 
@@ -414,12 +422,12 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const assistantText = "Reloaded assistant response";
 
 		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
-			sessionManager.appendModelChange("openai-codex/gpt-5.2-codex");
+			sessionManager.appendModelChange("openai-codex/gpt-5.5");
 			sessionManager.appendMessage({ role: "user", content: "Reload summary", timestamp: Date.now() - 2 });
 			appendStaleAssistantTurn(sessionManager, assistantText, {
 				api: "openai-codex-responses",
 				provider: "openai-codex",
-				model: "gpt-5.2-codex",
+				model: "gpt-5.5",
 			});
 			sessionManager.appendMessage({ role: "user", content: "Reload follow-up", timestamp: Date.now() - 1 });
 		});
@@ -427,7 +435,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
 		const { session } = await createSessionHarness(tempDir, reloadedSessionManager, {
 			provider: "openai-codex",
-			modelId: "gpt-5.2-codex",
+			modelId: "gpt-5.5",
 		});
 		sessions.push(session);
 
@@ -453,18 +461,18 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const assistantText = "Reloaded metadata-only response";
 
 		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
-			sessionManager.appendModelChange("openai-codex/gpt-5.2-codex");
+			sessionManager.appendModelChange("openai-codex/gpt-5.5");
 			appendStaleAssistantTurn(sessionManager, assistantText, {
 				api: "openai-codex-responses",
 				provider: "openai-codex",
-				model: "gpt-5.2-codex",
+				model: "gpt-5.5",
 			});
 		});
 
 		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
 		const { session } = await createSessionHarness(tempDir, reloadedSessionManager, {
 			provider: "openai-codex",
-			modelId: "gpt-5.2-codex",
+			modelId: "gpt-5.5",
 		});
 		sessions.push(session);
 
@@ -489,7 +497,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		expect(closeSpy).not.toHaveBeenCalled();
 		expect(session.providerSessionState.size).toBe(1);
 		expect(session.model?.provider).toBe("openai-codex");
-		expect(session.model?.id).toBe("gpt-5.2-codex");
+		expect(session.model?.id).toBe("gpt-5.5");
 		expectAssistantReplayMetadataPreserved(findRuntimeAssistant(session, assistantText));
 	});
 
@@ -544,18 +552,18 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const assistantText = "Reloaded content change response";
 
 		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
-			sessionManager.appendModelChange("openai-codex/gpt-5.2-codex");
+			sessionManager.appendModelChange("openai-codex/gpt-5.5");
 			appendStaleAssistantTurn(sessionManager, assistantText, {
 				api: "openai-codex-responses",
 				provider: "openai-codex",
-				model: "gpt-5.2-codex",
+				model: "gpt-5.5",
 			});
 		});
 
 		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
 		const { session } = await createSessionHarness(tempDir, reloadedSessionManager, {
 			provider: "openai-codex",
-			modelId: "gpt-5.2-codex",
+			modelId: "gpt-5.5",
 		});
 		sessions.push(session);
 
@@ -576,7 +584,7 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		expect(closeSpy).toHaveBeenCalledTimes(1);
 		expect(session.providerSessionState.size).toBe(0);
 		expect(session.model?.provider).toBe("openai-codex");
-		expect(session.model?.id).toBe("gpt-5.2-codex");
+		expect(session.model?.id).toBe("gpt-5.5");
 		expect(
 			session.messages.some(
 				message => message.role === "user" && getTextContent(message) === "Externally appended follow-up",
@@ -590,18 +598,18 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		const assistantText = "Reloaded model change response";
 
 		const { sessionFile } = await createPersistedSession(tempDir, sessionManager => {
-			sessionManager.appendModelChange("openai-codex/gpt-5.2-codex");
+			sessionManager.appendModelChange("openai-codex/gpt-5.5");
 			appendStaleAssistantTurn(sessionManager, assistantText, {
 				api: "openai-codex-responses",
 				provider: "openai-codex",
-				model: "gpt-5.2-codex",
+				model: "gpt-5.5",
 			});
 		});
 
 		const reloadedSessionManager = await SessionManager.open(sessionFile, tempDir);
 		const { session } = await createSessionHarness(tempDir, reloadedSessionManager, {
 			provider: "openai-codex",
-			modelId: "gpt-5.2-codex",
+			modelId: "gpt-5.5",
 		});
 		sessions.push(session);
 

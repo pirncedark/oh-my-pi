@@ -6,6 +6,10 @@
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import {
+	invalidateMessageCache,
+	registerMessageCacheInvalidator,
+} from "@oh-my-pi/pi-agent-core/compaction/message-cache";
+import {
 	type BranchSummaryMessage,
 	type CompactionSummaryMessage,
 	convertMessageToLlm,
@@ -19,8 +23,9 @@ import type {
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import userInterjectionTemplate from "../prompts/steering/user-interjection.md" with { type: "text" };
+import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
 
 export {
 	type BranchSummaryMessage,
@@ -37,8 +42,272 @@ export const SKILL_PROMPT_MESSAGE_TYPE = "skill-prompt";
 export const LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE = "lsp-late-diagnostic";
 export const BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE = "background-tan-dispatch";
 
+/**
+ * Logs provider-error turns so their actual cause is available outside the
+ * session transcript. No-op for non-error stop reasons.
+ */
+export function logProviderTurnError(msg: AssistantMessage): void {
+	if (msg.stopReason !== "error") return;
+	logger.warn("agent turn ended with provider error", {
+		provider: msg.provider,
+		model: msg.model,
+		errorMessage: msg.errorMessage,
+		errorStatus: msg.errorStatus,
+		errorId: msg.errorId,
+	});
+}
+
+const EPHEMERAL_REPLY_MAX_BYTES = 4096;
+const REPLAN_TITLE_CONTEXT_TURN_LIMIT = 6;
+
+/**
+ * Removes replay-bound provider state before reparenting an assistant message
+ * under a different user turn.
+ */
+export function sanitizeAssistantForReparentedHistory(message: AssistantMessage): AssistantMessage {
+	const content: AssistantMessage["content"] = [];
+	for (const block of message.content) {
+		if (block.type === "redactedThinking") continue;
+		if (block.type === "thinking") {
+			content.push({ type: "thinking", thinking: block.thinking });
+			continue;
+		}
+		content.push(block);
+	}
+	return { ...message, content, providerPayload: undefined };
+}
+
+/**
+ * Collapses degenerate repeated lines and bounds an ephemeral side-channel
+ * reply to 4 KiB.
+ */
+export function dedupeEphemeralReply(text: string): string {
+	if (!text) return text;
+	const lines = text.split("\n");
+	const out: string[] = [];
+	let i = 0;
+	while (i < lines.length) {
+		let j = i + 1;
+		while (j < lines.length && lines[j] === lines[i]) j++;
+		const runLen = j - i;
+		if (runLen > 3) {
+			out.push(lines[i], `[…${runLen}×]`);
+		} else {
+			for (let k = 0; k < runLen; k++) out.push(lines[i]);
+		}
+		i = j;
+	}
+	let result = out.join("\n");
+	if (Buffer.byteLength(result, "utf8") > EPHEMERAL_REPLY_MAX_BYTES) {
+		const suffix = "\n[…truncated]";
+		const budget = EPHEMERAL_REPLY_MAX_BYTES - Buffer.byteLength(suffix, "utf8");
+		while (Buffer.byteLength(result, "utf8") > budget) {
+			result = result.slice(0, -1);
+		}
+		result += suffix;
+	}
+	return result;
+}
+
+/** Builds the recent user/assistant context supplied to title regeneration. */
+export function buildReplanTitleContext(messages: AgentMessage[]): string {
+	const turns: TitleConversationTurn[] = [];
+	for (let i = messages.length - 1; i >= 0 && turns.length < REPLAN_TITLE_CONTEXT_TURN_LIMIT; i--) {
+		const message = messages[i];
+		if (!message) continue;
+		const turn = titleConversationTurnFromMessage(message);
+		if (turn) turns.push(turn);
+	}
+	turns.reverse();
+	return formatTitleConversationContext(turns);
+}
+
+/**
+ * Compares session messages by provider-replay semantics, ignoring runtime-only
+ * fields that do not change a restored request.
+ */
+export function didSessionMessagesChange(previousMessages: AgentMessage[], nextMessages: AgentMessage[]): boolean {
+	if (previousMessages.length !== nextMessages.length) return true;
+	return previousMessages.some(
+		(message, i) =>
+			!Bun.deepEquals(
+				normalizeSessionMessageForProviderReplay(message),
+				normalizeSessionMessageForProviderReplay(nextMessages[i]),
+			),
+	);
+}
+
+function textFromContent(content: unknown): string {
+	if (typeof content === "string") return content.trim();
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const block of content) {
+		if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
+		const text = block.text.trim();
+		if (text) parts.push(text);
+	}
+	return parts.join("\n\n");
+}
+
+function thinkingFromContent(content: unknown): string {
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const block of content) {
+		if (!isRecord(block) || block.type !== "thinking" || typeof block.thinking !== "string") continue;
+		const thinking = block.thinking.trim();
+		if (thinking) parts.push(thinking);
+	}
+	return parts.join("\n\n");
+}
+
+function titleConversationTurnFromMessage(message: AgentMessage): TitleConversationTurn | undefined {
+	if (message.role !== "user" && message.role !== "assistant") return undefined;
+	const text = textFromContent(message.content);
+	const thinking = message.role === "assistant" ? thinkingFromContent(message.content) : undefined;
+	if (!text && !thinking) return undefined;
+	return { role: message.role, ...(text ? { text } : {}), ...(thinking ? { thinking } : {}) };
+}
+
+function normalizeProviderReplayValue(value: unknown): unknown {
+	if (Array.isArray(value)) {
+		return value.map(normalizeProviderReplayValue);
+	}
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value).map(([key, entryValue]) => [key, normalizeProviderReplayValue(entryValue)]),
+		);
+	}
+	return value;
+}
+
+function normalizeSessionMessageForProviderReplay(message: AgentMessage): unknown {
+	switch (message.role) {
+		case "user":
+		case "developer":
+			return {
+				role: message.role,
+				content: normalizeProviderReplayValue(message.content),
+				providerPayload: message.providerPayload,
+			};
+		case "assistant": {
+			const isResponsesFamilyMessage =
+				message.api === "openai-responses" || message.api === "openai-codex-responses";
+			return {
+				role: message.role,
+				content:
+					isResponsesFamilyMessage && Array.isArray(message.content)
+						? message.content.flatMap(block => {
+								if (block.type === "thinking") {
+									return [];
+								}
+								if (block.type === "toolCall") {
+									return [
+										{
+											type: block.type,
+											id: block.id,
+											name: block.name,
+											arguments: block.arguments,
+										},
+									];
+								}
+								if (block.type === "text") {
+									return [{ type: block.type, text: block.text, textSignature: block.textSignature }];
+								}
+								return [normalizeProviderReplayValue(block)];
+							})
+						: normalizeProviderReplayValue(message.content),
+				api: message.api,
+				provider: message.provider,
+				model: message.model,
+				stopReason: message.stopReason,
+				errorMessage: message.errorMessage,
+				providerPayload: isResponsesFamilyMessage ? undefined : message.providerPayload,
+			};
+		}
+		case "toolResult":
+			return {
+				role: message.role,
+				toolName: message.toolName,
+				toolCallId: message.toolCallId,
+				isError: message.isError,
+				content: normalizeProviderReplayValue(message.content),
+			};
+		case "bashExecution":
+			return {
+				role: message.role,
+				command: message.command,
+				output: message.output,
+				exitCode: message.exitCode,
+				cancelled: message.cancelled,
+				meta: message.meta
+					? {
+							truncation: normalizeProviderReplayValue(message.meta.truncation),
+							limits: normalizeProviderReplayValue(message.meta.limits),
+							diagnostics: message.meta.diagnostics
+								? normalizeProviderReplayValue({
+										summary: message.meta.diagnostics.summary,
+										messages: message.meta.diagnostics.messages,
+									})
+								: undefined,
+						}
+					: undefined,
+				excludeFromContext: message.excludeFromContext,
+			};
+		case "pythonExecution":
+			return {
+				role: message.role,
+				code: message.code,
+				output: message.output,
+				exitCode: message.exitCode,
+				cancelled: message.cancelled,
+				meta: message.meta
+					? {
+							truncation: normalizeProviderReplayValue(message.meta.truncation),
+							limits: normalizeProviderReplayValue(message.meta.limits),
+							diagnostics: message.meta.diagnostics
+								? normalizeProviderReplayValue({
+										summary: message.meta.diagnostics.summary,
+										messages: message.meta.diagnostics.messages,
+									})
+								: undefined,
+						}
+					: undefined,
+				excludeFromContext: message.excludeFromContext,
+			};
+		case "custom":
+		case "hookMessage":
+			return {
+				role: message.role,
+				customType: message.customType,
+				content: normalizeProviderReplayValue(message.content),
+			};
+		case "branchSummary":
+			return { role: message.role, summary: message.summary };
+		case "compactionSummary":
+			return {
+				role: message.role,
+				summary: message.summary,
+				providerPayload: message.providerPayload,
+			};
+		case "fileMention":
+			return {
+				role: message.role,
+				files: message.files.map(file => ({
+					path: file.path,
+					content: file.content,
+					image: file.image,
+				})),
+			};
+		default:
+			return normalizeProviderReplayValue(message);
+	}
+}
+
 /** Fallback type for extension-injected messages that omit a custom type. */
 export const DEFAULT_CUSTOM_MESSAGE_TYPE = "custom-message";
+
+/** Custom message carrying a coding request delegated by the live voice model. */
+export const LIVE_DELEGATION_MESSAGE_TYPE = "live-delegation";
 
 /** Content shape accepted for extension-injected messages. */
 export type CustomMessageContent = string | (TextContent | ImageContent)[];
@@ -457,6 +726,14 @@ function stripImagesFromArrayContent(content: (TextContent | ImageContent)[]): S
  * pure local mutation and intentionally does neither.
  */
 export function stripImagesFromMessage(message: AgentMessage): number {
+	const removed = stripImagesFromMessageContent(message);
+	// The mutated message keeps its identity across context rebuilds, so drop its
+	// cached estimate/convert before the next pass counts/converts the new shape.
+	if (removed > 0) invalidateMessageCache(message);
+	return removed;
+}
+
+function stripImagesFromMessageContent(message: AgentMessage): number {
 	switch (message.role) {
 		case "user":
 		case "developer":
@@ -510,6 +787,43 @@ export function stripImagesFromMessage(message: AgentMessage): number {
 		default:
 			return 0;
 	}
+}
+
+/**
+ * Replace every `ImageContent` block in already-converted LLM {@link Message}s
+ * with a text placeholder, returning a new array only when something changed.
+ *
+ * Unlike {@link stripImagesFromMessage} (which mutates persisted `AgentMessage`s
+ * in place), this operates on the ephemeral provider-request view produced by
+ * {@link convertToLlm}, so history on disk keeps its images while the outbound
+ * request is scrubbed. Used to keep image blocks off the wire when the active
+ * model has no vision support (or `images.blockImages` is set) — e.g. after
+ * switching from a vision model to a text-only one mid-session (#5400).
+ *
+ * Consecutive placeholder texts collapse into one so a message that was nothing
+ * but images does not balloon into a run of identical notes.
+ */
+export function replaceLlmImagesWithText(messages: Message[], placeholder: string): Message[] {
+	let out: Message[] | undefined;
+	for (let i = 0; i < messages.length; i++) {
+		const msg = messages[i];
+		if (msg.role !== "user" && msg.role !== "developer" && msg.role !== "toolResult") continue;
+		const content = msg.content;
+		if (!Array.isArray(content) || !content.some(part => part.type === "image")) continue;
+		const replaced: (TextContent | ImageContent)[] = [];
+		for (const part of content) {
+			if (part.type !== "image") {
+				replaced.push(part);
+				continue;
+			}
+			const prev = replaced[replaced.length - 1];
+			if (prev?.type === "text" && prev.text === placeholder) continue;
+			replaced.push({ type: "text", text: placeholder });
+		}
+		if (out === undefined) out = messages.slice();
+		out[i] = { ...msg, content: replaced } as Message;
+	}
+	return out ?? messages;
 }
 
 /**
@@ -714,127 +1028,253 @@ function convertImageBearingCustomMessage(message: CustomMessage | HookMessage):
 }
 
 /**
+ * Per-message conversion result, keyed by message identity. `interruptedNext`
+ * records the neighbor state the fragment was built against so an assistant
+ * whose following {@link INTERRUPTED_THINKING_MESSAGE_TYPE} marker appears or
+ * disappears is recomputed (its LLM view strips the trailing thinking run only
+ * while that marker follows).
+ *
+ * WeakMap (not a symbol tag) is deliberate: `wrapSteeringForModel` and
+ * `deobfuscateAgentMessages` spread messages into fresh variants with different
+ * content; a symbol-keyed fragment would ride that spread and mis-convert the
+ * copy. Identity keying keeps the cache off spread copies.
+ */
+interface ConvertMemoEntry {
+	interruptedNext: boolean;
+	fragment: Message[];
+}
+const convertCache = new WeakMap<AgentMessage, ConvertMemoEntry>();
+
+// Array-level shortcuts over the per-message memo. The live agent mutates one
+// `AgentMessage[]` identity across a turn: appending new messages and swapping
+// the streaming tail (`context.messages[len-1] = partial → trailing`). Between
+// owner invalidations (prune/shake/strip bump `convertGeneration`) and for a
+// given array identity, only the last index is ever swapped and the array only
+// grows — interior prefix messages are immutable. That invariant lets two
+// shortcuts skip the O(N) re-walk:
+//   - exact-repeat: same array, same length, same generation, same tail identity
+//     → hand back the same outer array.
+//   - slice-on-growth: same array, same generation, length grew → copy the
+//     unchanged prefix output and reconvert only the neighbor-sensitive boundary
+//     message plus the appended suffix.
+// The tail-identity guard on exact-repeat catches the streaming snapshot swap
+// (partial → trailing is a fresh identity), so a settled tail is never served
+// from a stale mid-stream fragment.
+let convertGeneration = 0;
+let lastConvertInput: AgentMessage[] | undefined;
+let lastConvertLength = 0;
+let lastConvertOutput: Message[] | undefined;
+let lastConvertGeneration = -1;
+let lastConvertTail: AgentMessage | undefined;
+// Output-message count contributed by messages[0 .. lastConvertLength-1), i.e.
+// every message except the last. The last message is neighbor-sensitive (its LLM
+// view drops the trailing thinking run only while an interrupted-thinking marker
+// follows), so growth reconverts it rather than reusing its old fragment.
+let lastConvertPrefixOutputLen = 0;
+
+registerMessageCacheInvalidator(message => {
+	convertCache.delete(message);
+	convertGeneration++;
+});
+
+/** Convert one message to its LLM fragment. `interruptedNext` is true only for an
+ *  assistant turn immediately followed by its interrupted-thinking marker. */
+function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
+	switch (m.role) {
+		case "bashExecution":
+			if (m.excludeFromContext) {
+				return [];
+			}
+			return [
+				{
+					role: "user",
+					content: [{ type: "text", text: bashExecutionToText(m) }],
+					attribution: "user",
+					timestamp: m.timestamp,
+				},
+			];
+		case "pythonExecution":
+			if (m.excludeFromContext) {
+				return [];
+			}
+			return [
+				{
+					role: "user",
+					content: [{ type: "text", text: pythonExecutionToText(m) }],
+					attribution: "user",
+					timestamp: m.timestamp,
+				},
+			];
+		case "fileMention": {
+			// One `fileMention` can mix `@notes.md` (text) and `@screenshot.png` (image)
+			// in the same turn (`generateFileMentionMessages` packs every `@…` into a
+			// single message). Splitting by image presence keeps text-only mentions on
+			// the higher-priority `developer` slot while routing image attachments
+			// through `user`, the only Responses content slot that legitimately accepts
+			// `input_image` (Codex chatgpt.com /codex/responses rejects everything else
+			// with `Invalid value: 'input_image'`, #3443).
+			const wrap = (file: FileMentionMessage["files"][number]): string => {
+				const inner = file.content ? `\n${file.content}\n` : "\n";
+				return `<file path="${file.path}">${inner}</file>`;
+			};
+			const textFiles = m.files.filter(file => !file.image);
+			const imageFiles = m.files.filter(file => file.image);
+			const out: Message[] = [];
+			if (textFiles.length > 0) {
+				out.push({
+					role: "developer",
+					content: [{ type: "text" as const, text: textFiles.map(wrap).join("\n") }],
+					attribution: "user",
+					timestamp: m.timestamp,
+				});
+			}
+			if (imageFiles.length > 0) {
+				const content: (TextContent | ImageContent)[] = [
+					{ type: "text" as const, text: imageFiles.map(wrap).join("\n") },
+				];
+				for (const file of imageFiles) {
+					if (file.image) content.push(file.image);
+				}
+				out.push({
+					role: "user",
+					content,
+					attribution: "user",
+					timestamp: m.timestamp,
+				});
+			}
+			return out;
+		}
+		case "custom": {
+			if (!isCustomMessageContent(m.content)) return [];
+			if (isUserInvokedSkillPrompt(m)) {
+				return [
+					{
+						role: "user",
+						content: customMessageContentToLlmContent(m.content),
+						attribution: "user",
+						timestamp: m.timestamp,
+					},
+				];
+			}
+			const split = convertImageBearingCustomMessage(m);
+			if (split) return split;
+			const converted = convertMessageToLlm(m);
+			return converted ? [converted] : [];
+		}
+		case "hookMessage": {
+			if (!isCustomMessageContent(m.content)) return [];
+			const split = convertImageBearingCustomMessage(m);
+			if (split) return split;
+			const converted = convertMessageToLlm(m);
+			return converted ? [converted] : [];
+		}
+		case "assistant": {
+			// A user-interrupted turn keeps its trailing thinking run on the
+			// persisted/displayed message so reload and Ctrl+L rebuilds still
+			// show it. That run is incomplete/unsigned and gets rejected on
+			// resend, so strip it here — LLM path only — when the hidden
+			// interrupted-thinking continuity message follows.
+			const source = interruptedNext ? stripDemotedThinkingForLlm(m) : m;
+			const converted = convertMessageToLlm(source);
+			return converted ? [converted] : [];
+		}
+		case "branchSummary":
+		case "compactionSummary":
+		case "user":
+		case "developer":
+		case "toolResult": {
+			// Core roles share one transformer with agent-core —
+			// duplicating them here is how snapcompact frames once
+			// silently fell off the provider request.
+			const converted = convertMessageToLlm(m);
+			return converted ? [converted] : [];
+		}
+		default:
+			m satisfies never;
+			return [];
+	}
+}
+
+/** Cached per-message conversion. Reuses the stored fragment while identity and
+ *  `interruptedNext` neighbor state hold; recomputes on a neighbor flip. */
+function convertOneCached(m: AgentMessage, interruptedNext: boolean): Message[] {
+	const cached = convertCache.get(m);
+	if (cached !== undefined && cached.interruptedNext === interruptedNext) return cached.fragment;
+	const fragment = convertOne(m, interruptedNext);
+	convertCache.set(m, { interruptedNext, fragment });
+	return fragment;
+}
+
+/**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
  * This is used by:
  * - Agent's transormToLlm option (for prompt calls and queued messages)
  * - Compaction's generateSummary (for summarization)
  * - Custom extensions and tools
+ *
+ * Settled history converts once and is reused per message identity: an
+ * append-only turn on the same array re-pays only the new suffix, and an
+ * unchanged re-convert of the same array hands back the same outer `Message[]`.
+ * Owner mutations (prune/shake/strip-images) invalidate the affected message
+ * through the shared registry before the next pass.
  */
 export function convertToLlm(messages: AgentMessage[]): Message[] {
-	return messages.flatMap((m, index): Message[] => {
-		switch (m.role) {
-			case "bashExecution":
-				if (m.excludeFromContext) {
-					return [];
-				}
-				return [
-					{
-						role: "user",
-						content: [{ type: "text", text: bashExecutionToText(m) }],
-						attribution: "user",
-						timestamp: m.timestamp,
-					},
-				];
-			case "pythonExecution":
-				if (m.excludeFromContext) {
-					return [];
-				}
-				return [
-					{
-						role: "user",
-						content: [{ type: "text", text: pythonExecutionToText(m) }],
-						attribution: "user",
-						timestamp: m.timestamp,
-					},
-				];
-			case "fileMention": {
-				// One `fileMention` can mix `@notes.md` (text) and `@screenshot.png` (image)
-				// in the same turn (`generateFileMentionMessages` packs every `@…` into a
-				// single message). Splitting by image presence keeps text-only mentions on
-				// the higher-priority `developer` slot while routing image attachments
-				// through `user`, the only Responses content slot that legitimately accepts
-				// `input_image` (Codex chatgpt.com /codex/responses rejects everything else
-				// with `Invalid value: 'input_image'`, #3443).
-				const wrap = (file: FileMentionMessage["files"][number]): string => {
-					const inner = file.content ? `\n${file.content}\n` : "\n";
-					return `<file path="${file.path}">${inner}</file>`;
-				};
-				const textFiles = m.files.filter(file => !file.image);
-				const imageFiles = m.files.filter(file => file.image);
-				const out: Message[] = [];
-				if (textFiles.length > 0) {
-					out.push({
-						role: "developer",
-						content: [{ type: "text" as const, text: textFiles.map(wrap).join("\n") }],
-						attribution: "user",
-						timestamp: m.timestamp,
-					});
-				}
-				if (imageFiles.length > 0) {
-					const content: (TextContent | ImageContent)[] = [
-						{ type: "text" as const, text: imageFiles.map(wrap).join("\n") },
-					];
-					for (const file of imageFiles) {
-						if (file.image) content.push(file.image);
-					}
-					out.push({
-						role: "user",
-						content,
-						attribution: "user",
-						timestamp: m.timestamp,
-					});
-				}
-				return out;
-			}
-			case "custom": {
-				if (!isCustomMessageContent(m.content)) return [];
-				if (isUserInvokedSkillPrompt(m)) {
-					return [
-						{
-							role: "user",
-							content: customMessageContentToLlmContent(m.content),
-							attribution: "user",
-							timestamp: m.timestamp,
-						},
-					];
-				}
-				const split = convertImageBearingCustomMessage(m);
-				if (split) return split;
-				const converted = convertMessageToLlm(m);
-				return converted ? [converted] : [];
-			}
-			case "hookMessage": {
-				if (!isCustomMessageContent(m.content)) return [];
-				const split = convertImageBearingCustomMessage(m);
-				if (split) return split;
-				const converted = convertMessageToLlm(m);
-				return converted ? [converted] : [];
-			}
-			case "assistant": {
-				// A user-interrupted turn keeps its trailing thinking run on the
-				// persisted/displayed message so reload and Ctrl+L rebuilds still
-				// show it. That run is incomplete/unsigned and gets rejected on
-				// resend, so strip it here — LLM path only — when the hidden
-				// interrupted-thinking continuity message follows.
-				const source = followedByInterruptedThinking(messages, index) ? stripDemotedThinkingForLlm(m) : m;
-				const converted = convertMessageToLlm(source);
-				return converted ? [converted] : [];
-			}
-			case "branchSummary":
-			case "compactionSummary":
-			case "user":
-			case "developer":
-			case "toolResult": {
-				// Core roles share one transformer with agent-core —
-				// duplicating them here is how snapcompact frames once
-				// silently fell off the provider request.
-				const converted = convertMessageToLlm(m);
-				return converted ? [converted] : [];
-			}
-			default:
-				m satisfies never;
-				return [];
-		}
-	});
+	const len = messages.length;
+	const sameArray = messages === lastConvertInput && lastConvertGeneration === convertGeneration;
+	const tail = len > 0 ? messages[len - 1] : undefined;
+
+	// Exact-repeat: same array, same length, same trailing identity → reuse the
+	// outer array. The tail-identity check rejects the streaming snapshot swap
+	// (partial → settled trailing keeps array identity/length but mints a fresh
+	// tail), so a settled tail never reads a stale mid-stream fragment.
+	if (sameArray && lastConvertOutput !== undefined && len === lastConvertLength && tail === lastConvertTail) {
+		return lastConvertOutput;
+	}
+
+	// Slice-on-growth: same array grew by append. Every interior message is
+	// immutable under one array identity, so copy the unchanged prefix output
+	// (messages[0 .. lastLen-1)) and reconvert only the old boundary message
+	// (neighbor-sensitive: a following interrupted-thinking marker may now exist)
+	// plus the appended suffix. The boundary-identity check (old tail still sits
+	// at its old index) rejects an in-place interior splice-replace that grew the
+	// array while swapping earlier identities, forcing a full rebuild.
+	let out: Message[];
+	let start: number;
+	if (
+		sameArray &&
+		lastConvertOutput !== undefined &&
+		len > lastConvertLength &&
+		lastConvertLength > 0 &&
+		messages[lastConvertLength - 1] === lastConvertTail &&
+		lastConvertPrefixOutputLen <= lastConvertOutput.length
+	) {
+		out = lastConvertOutput.slice(0, lastConvertPrefixOutputLen);
+		start = lastConvertLength - 1;
+	} else {
+		out = [];
+		start = 0;
+	}
+
+	// Output length contributed by messages[0 .. len-1), captured when the loop
+	// reaches the final index so the next growth can reuse this prefix.
+	let prefixOutputLen = 0;
+	for (let i = start; i < len; i++) {
+		if (i === len - 1) prefixOutputLen = out.length;
+		const m = messages[i];
+		const interruptedNext = m.role === "assistant" && followedByInterruptedThinking(messages, i);
+		const fragment = convertOneCached(m, interruptedNext);
+		for (const msg of fragment) out.push(msg);
+	}
+	if (len === 0) prefixOutputLen = 0;
+
+	// Record for the next call's shortcuts. `out` is a fresh array (slice or new),
+	// so a prior caller holding the previous `lastConvertOutput` never sees it grow.
+	lastConvertInput = messages;
+	lastConvertLength = len;
+	lastConvertOutput = out;
+	lastConvertGeneration = convertGeneration;
+	lastConvertTail = tail;
+	lastConvertPrefixOutputLen = prefixOutputLen;
+	return out;
 }

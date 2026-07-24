@@ -526,6 +526,57 @@ describe("YieldTool", () => {
 		).rejects.toThrow("data is required when yield indicates success");
 	});
 
+	it("aborts instead of throwing forever after repeated untyped empty results", async () => {
+		const tool = new YieldTool(createSession());
+		const expectedGuidance =
+			'result must contain either `data` or `error`. Use `{result: {data: <your output>}}` for success or `{result: {error: "message"}}` for failure.';
+
+		for (let attempt = 1; attempt <= 3; attempt++) {
+			await expect(tool.execute(`call-empty-retry-${attempt}`, { result: {} } as never)).rejects.toThrow(
+				expectedGuidance,
+			);
+		}
+
+		const abortResult = await tool.execute("call-empty-abort", { result: {} } as never);
+		const details = abortResult.details;
+		expect(details).toBeDefined();
+		if (!details) throw new Error("missing abort details");
+		expect(details.status).toBe("aborted");
+		expect(details.data).toBeUndefined();
+		expect(String(details.error)).toContain("retrying forever");
+		expect(abortResult.content).toEqual([{ type: "text", text: expect.stringContaining("Task aborted") }]);
+	});
+
+	it("resets the untyped empty-result retry budget after a valid yield", async () => {
+		const tool = new YieldTool(createSession());
+		const expectedGuidance =
+			'result must contain either `data` or `error`. Use `{result: {data: <your output>}}` for success or `{result: {error: "message"}}` for failure.';
+
+		for (let attempt = 1; attempt <= 2; attempt++) {
+			await expect(tool.execute(`call-empty-before-valid-${attempt}`, { result: {} } as never)).rejects.toThrow(
+				expectedGuidance,
+			);
+		}
+
+		const validResult = await tool.execute("call-valid-reset", { result: { data: { ok: true } } } as never);
+		expect(validResult.details).toEqual({ data: { ok: true }, status: "success", error: undefined });
+
+		for (let attempt = 1; attempt <= 3; attempt++) {
+			await expect(tool.execute(`call-empty-after-valid-${attempt}`, { result: {} } as never)).rejects.toThrow(
+				expectedGuidance,
+			);
+		}
+
+		const abortResult = await tool.execute("call-empty-after-reset-abort", { result: {} } as never);
+		const details = abortResult.details;
+		expect(details).toBeDefined();
+		if (!details) throw new Error("missing abort details");
+		expect(details.status).toBe("aborted");
+		expect(details.data).toBeUndefined();
+		expect(String(details.error)).toContain("retrying forever");
+		expect(abortResult.content).toEqual([{ type: "text", text: expect.stringContaining("Task aborted") }]);
+	});
+
 	it("exposes typed last-turn mode in the argument schema", () => {
 		const tool = new YieldTool(createSession());
 		const parameters = tool.parameters as unknown as Record<string, unknown>;
@@ -1055,8 +1106,8 @@ describe("YieldTool", () => {
 		).rejects.toThrow("Output does not match schema");
 	});
 
-	it("rejects nested-array shape mismatches with a retry hint (explore-style JTD)", async () => {
-		// Regression for the GLM/explore failure mode: model invents per-file fields
+	it("rejects nested-array shape mismatches with a retry hint (scout-style JTD)", async () => {
+		// Regression for the GLM/scout failure mode: model invents per-file fields
 		// (`ref`, `surface`, …) instead of the schema's `path` + `description`. The
 		// in-tool validator MUST surface the mismatch with a retry directive so the
 		// subagent can fix its output before the parent runs its post-mortem check.
@@ -1087,13 +1138,13 @@ describe("YieldTool", () => {
 			],
 		};
 
-		await expect(tool.execute("call-explore-1", { result: { data: badPayload } } as never)).rejects.toThrow(
+		await expect(tool.execute("call-scout-1", { result: { data: badPayload } } as never)).rejects.toThrow(
 			/files\/0\/path: is required.*Call yield again with the corrected shape/,
 		);
 
 		// Third retry still throws with one attempt remaining advertised in the hint.
-		await tool.execute("call-explore-2", { result: { data: badPayload } } as never).catch(() => {});
-		await expect(tool.execute("call-explore-3", { result: { data: badPayload } } as never)).rejects.toThrow(
+		await tool.execute("call-scout-2", { result: { data: badPayload } } as never).catch(() => {});
+		await expect(tool.execute("call-scout-3", { result: { data: badPayload } } as never)).rejects.toThrow(
 			"this is the final retry before the schema constraint is dropped",
 		);
 	});
@@ -1129,7 +1180,7 @@ describe("YieldTool", () => {
 	it("rejects submissions without a result object", async () => {
 		const tool = new YieldTool(createSession());
 		await expect(tool.execute("call-3", {} as never)).rejects.toThrow(
-			"result must be an object containing either data or error",
+			'Submit success as {"result":{"data":<your output>}} or failure as {"result":{"error":"message"}}.',
 		);
 	});
 	it("sets lenientArgValidation so agent-loop bypasses validation errors", () => {

@@ -7,6 +7,7 @@ import type {
 	FetchImpl,
 	Model,
 	ModelSpec,
+	ProviderResponseMetadata,
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
@@ -48,12 +49,39 @@ function stalledBody(bytes: Uint8Array[] = []): ReadableStream<Uint8Array> {
 }
 
 function delayedBody(chunks: Array<{ atMs: number; bytes: Uint8Array }>): ReadableStream<Uint8Array> {
+	let closed = false;
+	const timers: Timer[] = [];
+	const clearTimers = () => {
+		closed = true;
+		for (const timer of timers) clearTimeout(timer);
+		timers.length = 0;
+	};
 	return new ReadableStream<Uint8Array>({
 		start(controller) {
+			const enqueue = (bytes: Uint8Array) => {
+				if (!closed) controller.enqueue(bytes);
+			};
 			for (const chunk of chunks) {
-				setTimeout(() => controller.enqueue(chunk.bytes), chunk.atMs);
+				if (chunk.atMs <= 0) {
+					enqueue(chunk.bytes);
+				} else {
+					timers.push(setTimeout(() => enqueue(chunk.bytes), chunk.atMs));
+				}
 			}
-			setTimeout(() => controller.close(), Math.max(...chunks.map(chunk => chunk.atMs)) + 1);
+			timers.push(
+				setTimeout(
+					() => {
+						if (!closed) {
+							clearTimers();
+							controller.close();
+						}
+					},
+					Math.max(...chunks.map(chunk => chunk.atMs)) + 1,
+				),
+			);
+		},
+		cancel() {
+			clearTimers();
 		},
 	});
 }
@@ -157,9 +185,16 @@ describe("streamPiNative request shape", () => {
 		// it twice would let a logged request leak the gateway bearer. The other
 		// fields are non-serializable function/runtime handles.
 		const captured: { init?: RequestInit } = {};
+		let responseMetadata: ProviderResponseMetadata | undefined;
 		const fetchImpl: FetchImpl = (async (_input, init) => {
 			captured.init = init;
-			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }]);
+			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }], {
+				headers: {
+					"Content-Type": "text/event-stream",
+					"X-Request-Id": "gateway-request-id",
+					"CF-AIG-Cache-Status": "HIT",
+				},
+			});
 		}) as FetchImpl;
 
 		const controller = new AbortController();
@@ -167,8 +202,12 @@ describe("streamPiNative request shape", () => {
 			apiKey: "gw-bearer",
 			fetch: fetchImpl,
 			signal: controller.signal,
-			onPayload: () => undefined,
-			onResponse: () => undefined,
+			onPayload: () => {
+				throw new Error("the gateway payload is unavailable to the client");
+			},
+			onResponse: response => {
+				responseMetadata = response;
+			},
 			onSseEvent: () => undefined,
 			providerSessionState: new Map(),
 			maxTokens: 1024,
@@ -185,6 +224,14 @@ describe("streamPiNative request shape", () => {
 		expect("providerSessionState" in body.options).toBe(false);
 		// And the legitimate options survive
 		expect(body.options.maxTokens).toBe(1024);
+		expect(responseMetadata).toMatchObject({
+			status: 200,
+			requestId: "gateway-request-id",
+			headers: {
+				"x-request-id": "gateway-request-id",
+				"cf-aig-cache-status": "HIT",
+			},
+		});
 	});
 
 	it("normalizes trailing slashes on `baseUrl` so the endpoint never double-slashes", async () => {
@@ -348,8 +395,8 @@ describe("streamPiNative event flow", () => {
 		const stream = streamPiNative(fakeModel(), baseContext, {
 			apiKey: "k",
 			fetch: fetchImpl,
-			streamFirstEventTimeoutMs: 40,
-			streamIdleTimeoutMs: 30,
+			streamFirstEventTimeoutMs: 1000,
+			streamIdleTimeoutMs: 1000,
 		});
 
 		const result = await stream.result();

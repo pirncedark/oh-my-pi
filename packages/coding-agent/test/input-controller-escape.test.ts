@@ -448,6 +448,35 @@ describe("InputController escape behavior", () => {
 		expect(spies.abort).not.toHaveBeenCalled();
 	});
 
+	it("dismisses an active /btw panel before aborting loop mode", () => {
+		const { ctx, editor, spies } = createContext();
+		ctx.loopModeEnabled = true;
+		mutableSessionState(ctx).isStreaming = true;
+		spies.hasActiveBtw.mockReturnValue(true);
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.handleBtwEscape).toHaveBeenCalledTimes(1);
+		expect(spies.abort).not.toHaveBeenCalled();
+		expect(ctx.loopModeEnabled).toBe(true);
+	});
+
+	it("dismisses an active /btw panel before aborting maintenance", () => {
+		const { ctx, editor, spies } = createContext();
+		abortViewSession(ctx).isGeneratingHandoff = true;
+		spies.hasActiveBtw.mockReturnValue(true);
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.handleBtwEscape).toHaveBeenCalledTimes(1);
+		expect(spies.abortHandoff).not.toHaveBeenCalled();
+		expect(spies.abort).not.toHaveBeenCalled();
+	});
+
 	it("aborts an active streaming turn on the first Esc without asking for confirmation", () => {
 		const { ctx, editor, spies } = createContext();
 		mutableSessionState(ctx).isStreaming = true;
@@ -638,6 +667,24 @@ describe("InputController escape behavior", () => {
 
 		expect(ctx.showTreeSelector).not.toHaveBeenCalled();
 		expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
+	});
+
+	it("silences TTS before aborting an overlapping agent turn (#6118)", () => {
+		const clear = vi.spyOn(vocalizer, "clear").mockImplementation(() => {});
+		vi.spyOn(vocalizer, "isSpeaking").mockReturnValue(true);
+		const { ctx, editor, spies } = createContext();
+		const pauseLoop = vi.fn();
+		ctx.loopModeEnabled = true;
+		ctx.pauseLoop = pauseLoop;
+		mutableSessionState(ctx).isStreaming = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(clear).toHaveBeenCalledTimes(1);
+		expect(pauseLoop).not.toHaveBeenCalled();
+		expect(spies.abort).not.toHaveBeenCalled();
 	});
 
 	it("silences a still-audible vocalizer on Esc instead of opening the tree selector (#4521)", () => {

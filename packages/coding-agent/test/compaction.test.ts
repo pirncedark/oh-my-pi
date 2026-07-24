@@ -400,6 +400,64 @@ describe("estimateTokens excludeEncryptedReasoning (compaction floor)", () => {
 	});
 });
 
+describe("bigint tool arguments", () => {
+	it("preserves exact values through local compaction estimation and summary rendering", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected anthropic/claude-sonnet-4-5 model to exist");
+
+		const toolCallMessage: AssistantMessage = {
+			...createAssistantMessage("", createMockUsage(1_000, 100)),
+			content: [
+				{
+					type: "toolCall",
+					id: "call_bigint",
+					name: "lookup",
+					arguments: { rowId: 9_007_199_254_740_993n },
+				},
+			],
+			stopReason: "toolUse",
+		};
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("Look up the row")),
+			createMessageEntry(toolCallMessage),
+			createMessageEntry({
+				role: "toolResult",
+				toolCallId: "call_bigint",
+				toolName: "lookup",
+				content: [{ type: "text", text: "found" }],
+				isError: false,
+				timestamp: Date.now(),
+			}),
+			createMessageEntry(createUserMessage("Continue")),
+			createMessageEntry(createAssistantMessage("Done", createMockUsage(2_000, 100))),
+		];
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1,
+			remoteEnabled: false,
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(createAssistantMessage("summary"));
+		const result = await compact(preparation, model, "test-api-key");
+
+		let renderedPrompts = "";
+		for (const call of completeSpy.mock.calls) {
+			for (const message of call[1].messages) {
+				if (typeof message.content === "string") {
+					renderedPrompts += message.content;
+					continue;
+				}
+				for (const block of message.content) {
+					if (block.type === "text") renderedPrompts += block.text;
+				}
+			}
+		}
+		expect(renderedPrompts).toContain('"9007199254740993"');
+		expect(result.summary).toContain("summary");
+	});
+});
+
 describe("remote compaction setting", () => {
 	it("forwards an explicit initiator override to local summarization requests", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -1181,7 +1239,9 @@ describe("buildSessionContext", () => {
 		const entries: SessionEntry[] = [u1, a1, compact1, u2, compact2, u3];
 
 		const transcript = buildSessionContext(entries, undefined, undefined, { transcript: true });
-		// Nothing erased: every message survives, compactions sit where they fired.
+		// Nothing dropped positionally: every message survives, compactions sit
+		// where they fired. Superseded compaction summaries are elided in the
+		// forward transcript; only the active (latest) compaction keeps its text.
 		expect(transcript.messages.map(m => m.role)).toEqual([
 			"user",
 			"assistant",
@@ -1192,7 +1252,8 @@ describe("buildSessionContext", () => {
 		]);
 		const first = transcript.messages[2] as { summary: string };
 		const second = transcript.messages[4] as { summary: string; images?: unknown };
-		expect(first.summary).toContain("First summary");
+		expect(first.summary).toContain("Superseded compaction summary elided");
+		expect(first.summary).not.toContain("First summary");
 		expect(second.summary).toContain("Second summary");
 		// Snapcompact frames ride along in the transcript too.
 		expect(second.images).toEqual([{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" }]);

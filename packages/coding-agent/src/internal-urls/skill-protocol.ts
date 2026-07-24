@@ -12,12 +12,12 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { getActiveSkills } from "../extensibility/skills";
+import { isMarkdownPath } from "../utils/lang-from-path";
 import { buildDirectoryResource } from "./filesystem-resource";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 
 function getContentType(filePath: string): InternalResource["contentType"] {
-	const ext = path.extname(filePath).toLowerCase();
-	if (ext === ".md") return "text/markdown";
+	if (isMarkdownPath(filePath)) return "text/markdown";
 	return "text/plain";
 }
 
@@ -72,7 +72,7 @@ export class SkillProtocolHandler implements ProtocolHandler {
 				throw new Error("Path traversal is not allowed");
 			}
 		} else {
-			targetPath = skill.filePath;
+			targetPath = context?.pathOnly === true ? skill.baseDir : skill.filePath;
 		}
 
 		let stats: fsTypes.Stats;

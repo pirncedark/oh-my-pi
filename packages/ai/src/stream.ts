@@ -17,9 +17,10 @@ import { CATALOG_PROVIDERS, type ProviderCatalogEntry } from "@oh-my-pi/pi-catal
 import { CODEX_BASE_URL } from "@oh-my-pi/pi-catalog/wire/codex";
 import { $env, $pickenv, getConfigRootDir, isEnoent, logger, withExtraCaFetch } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
-import { AUTH_RETRY_STEPS, isApiKeyResolver, resolveRetryKey } from "./auth-retry";
+import { createAuthRetryKeyState, isApiKeyResolver, resolveNextAuthRetryKey } from "./auth-retry";
 import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
+import { isInvalidatedOAuthTokenError } from "./error/auth-classify";
 import { isUsageLimitOutcome } from "./error/rate-limit";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
@@ -72,6 +73,7 @@ import type {
 	ThinkingBudgets,
 	ToolChoice,
 } from "./types";
+import { resolveCacheRetention } from "./utils";
 import { AssistantMessageEventStream } from "./utils/event-stream";
 import { isFoundryEnabled } from "./utils/foundry";
 import { wrapLeakedThinkingStream } from "./utils/leaked-thinking-stream";
@@ -774,6 +776,7 @@ function streamDispatch<TApi extends Api>(
 		...debugOptions,
 		fetch: wrapFetchForProxy(debugOptions.fetch ?? (globalThis.fetch as FetchImpl), model.provider),
 	} as OptionsForApi<TApi>;
+	assertExplicitOpenAIResponsesPromptCacheSupport(model, requestOptions);
 
 	// Check custom API registry first (extension-provided APIs like "vertex-claude-api")
 	const customApiProvider = getCustomApi(model.api);
@@ -978,17 +981,20 @@ function isRetryableUpstreamError(error: unknown, status: number | undefined, me
 	// per-minute caps) classify as RATE_LIMIT_EXCEEDED in
 	// `parseRateLimitReason` and stay in the provider's own backoff layer
 	// instead of burning siblings.
+	if (AIError.isUsageLimit(error)) return true;
+	if (isInvalidatedOAuthTokenError(error)) return true;
 	if (status === 401) return true;
-	void error;
 	return isUsageLimitOutcome(status, message);
 }
 
 function createAssistantAuthError(message: AssistantMessage): Error {
 	const text = message.errorMessage ?? "Provider authentication failed";
 	const status = extractStatusFromAssistantError(message);
-	return status === undefined
-		? new AIError.ProviderResponseError(text, { kind: "runtime" })
-		: new ProviderHttpError(text, status);
+	const error =
+		status === undefined
+			? new AIError.ProviderResponseError(text, { kind: "runtime" })
+			: new ProviderHttpError(text, status);
+	return typeof message.errorId === "number" ? AIError.attach(error, message.errorId) : error;
 }
 
 function emitBufferedEvents(stream: AssistantMessageEventStream, events: AssistantMessageEvent[]): void {
@@ -1008,16 +1014,17 @@ export function streamSimple<TApi extends Api>(
 		...debugOptions,
 		fetch: wrapFetchForProxy(debugOptions.fetch ?? (globalThis.fetch as FetchImpl), model.provider),
 	} as SimpleStreamOptions;
+
 	const apiKeyResolver = isApiKeyResolver(requestOptions?.apiKey) ? requestOptions.apiKey : undefined;
 	if (apiKeyResolver) {
 		const outer = new AssistantMessageEventStream();
 		const signal = requestOptions?.signal;
-		// One inner attempt against a resolved string key. When
-		// `captureAuthFailure` is set, a retryable auth error that arrives before
-		// any replay-unsafe event is buffered and returned (so the caller can
-		// retry with a fresh key) instead of surfaced. The terminal attempt
-		// clears the flag and emits whatever it gets.
-		const runAttempt = async (apiKey: string, captureAuthFailure: boolean): Promise<AuthRetryFailure | undefined> => {
+		// One inner attempt against a resolved string key. A retryable auth error
+		// that arrives before any replay-unsafe event is buffered and returned
+		// (so the caller can retry with a fresh key) instead of surfaced. Once any
+		// non-start event escapes, retry is no longer safe and the failure is
+		// emitted directly.
+		const runAttempt = async (apiKey: string): Promise<AuthRetryFailure | undefined> => {
 			const bufferedEvents: AssistantMessageEvent[] = [];
 			let emittedReplayUnsafeEvent = false;
 			const flushBuffered = (): void => {
@@ -1034,7 +1041,6 @@ export function streamSimple<TApi extends Api>(
 					}
 					if (
 						!emittedReplayUnsafeEvent &&
-						captureAuthFailure &&
 						event.type === "error" &&
 						isRetryableUpstreamError(
 							event.error,
@@ -1054,7 +1060,6 @@ export function streamSimple<TApi extends Api>(
 			} catch (error) {
 				if (
 					!emittedReplayUnsafeEvent &&
-					captureAuthFailure &&
 					isRetryableUpstreamError(
 						error,
 						AIError.status(error),
@@ -1096,27 +1101,16 @@ export function streamSimple<TApi extends Api>(
 				outer.fail(new AIError.MissingApiKeyError(model.provider));
 				return;
 			}
-			let failure = await runAttempt(lastKey, true);
+			const retryState = createAuthRetryKeyState(lastKey);
+			let failure = await runAttempt(lastKey);
 			if (!failure) return;
-			// a/b/c policy: refresh the same account (lastChance=false), then
-			// switch to a sibling (lastChance=true). A step is skipped when the
-			// resolver yields the same key it just tried or `undefined`; the
-			// final step's attempt clears the capture flag so it emits directly.
-			for (let step = 0; step < AUTH_RETRY_STEPS.length; step++) {
+			while (true) {
 				// Caller aborted between attempts: don't mint a fresh token or fire
 				// another doomed request — emit the captured failure instead.
 				if (signal?.aborted) break;
-				const nextKey = await resolveRetryKey(
-					apiKeyResolver,
-					AUTH_RETRY_STEPS[step]!,
-					failure.error,
-					signal,
-					lastKey,
-				);
-				if (nextKey === undefined || nextKey === lastKey) continue;
-				lastKey = nextKey;
-				const isLastStep = step === AUTH_RETRY_STEPS.length - 1;
-				const next = await runAttempt(nextKey, !isLastStep);
+				const nextKey = await resolveNextAuthRetryKey(retryState, apiKeyResolver, failure.error, signal);
+				if (nextKey === undefined) break;
+				const next = await runAttempt(nextKey);
 				if (!next) return;
 				failure = next;
 			}
@@ -1187,12 +1181,17 @@ export function streamSimple<TApi extends Api>(
 
 	// Kimi Code - route to dedicated handler that wraps OpenAI or Anthropic API
 	if (isKimiModel(model)) {
-		// Pass raw SimpleStreamOptions - streamKimi handles mapping internally
-		return withProviderInFlightLimit(model, requestOptions, () =>
+		// streamKimi handles openai/anthropic format mapping internally, but the
+		// mandatory-reasoning clamp is a request-shaping concern owned here: K3's
+		// `supports_thinking_type: "only"` endpoint rejects disabled/omitted
+		// thinking, so clamp disabled requests to the lowest supported effort
+		// (mirrors the mapOptionsForApi path every other provider takes).
+		const kimiOptions = normalizeMandatoryReasoningOptions(model, requestOptions);
+		return withProviderInFlightLimit(model, kimiOptions, () =>
 			streamKimi(model as Model<"openai-completions">, context, {
-				...requestOptions,
+				...kimiOptions,
 				apiKey,
-				format: requestOptions?.kimiApiFormat ?? "anthropic",
+				format: kimiOptions?.kimiApiFormat,
 			}),
 		);
 	}
@@ -1244,6 +1243,7 @@ export const ANTHROPIC_THINKING: Record<Effort, number> = {
 	medium: 8192,
 	high: 16384,
 	xhigh: 32768,
+	max: 32768,
 };
 
 const GOOGLE_THINKING: Record<Effort, number> = {
@@ -1252,6 +1252,7 @@ const GOOGLE_THINKING: Record<Effort, number> = {
 	medium: 8192,
 	high: 16384,
 	xhigh: 24575,
+	max: 32768,
 };
 
 const BEDROCK_CLAUDE_THINKING: Record<Effort, number> = {
@@ -1260,6 +1261,7 @@ const BEDROCK_CLAUDE_THINKING: Record<Effort, number> = {
 	medium: 8192,
 	high: 16384,
 	xhigh: 16384,
+	max: 32768,
 };
 
 function resolveBedrockThinkingBudget(
@@ -1402,6 +1404,41 @@ function normalizeMandatoryReasoningOptions<TApi extends Api>(
 	return { ...options, reasoning: floor, disableReasoning: undefined };
 }
 
+function supportsExplicitOpenAIResponsesPromptCache(compat: unknown): boolean {
+	return (
+		typeof compat === "object" &&
+		compat !== null &&
+		"supportsPromptCacheBreakpoints" in compat &&
+		compat.supportsPromptCacheBreakpoints === true
+	);
+}
+
+function isOpenAIResponsesPromptCacheSurface<TApi extends Api>(model: Model<TApi>): boolean {
+	return (
+		model.api === "openai-responses" ||
+		model.api === "azure-openai-responses" ||
+		(model.api === "openrouter" && $env.PI_OPENROUTER_RESPONSES !== "0")
+	);
+}
+
+function assertExplicitOpenAIResponsesPromptCacheSupport<TApi extends Api>(
+	model: Model<TApi>,
+	options?: StreamOptions,
+): void {
+	if (
+		model.transport === "pi-native" ||
+		resolveCacheRetention(options?.cacheRetention) === "none" ||
+		options?.promptCache?.mode !== "explicit" ||
+		!isOpenAIResponsesPromptCacheSurface(model) ||
+		supportsExplicitOpenAIResponsesPromptCache(model.compat)
+	) {
+		return;
+	}
+	throw new AIError.ConfigurationError(
+		`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; enable compat.supportsPromptCacheBreakpoints only for a compatible endpoint.`,
+	);
+}
+
 function mapOptionsForApi<TApi extends Api>(
 	model: Model<TApi>,
 	rawOptions?: SimpleStreamOptions,
@@ -1429,9 +1466,6 @@ function mapOptionsForApi<TApi extends Api>(
 		streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
 		providerSessionState: options?.providerSessionState,
-		useInteractionsApi: options?.useInteractionsApi,
-		storeInteraction: options?.storeInteraction,
-		previousInteractionId: options?.previousInteractionId,
 		maxInFlightRequests: options?.maxInFlightRequests,
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
@@ -1579,6 +1613,8 @@ function mapOptionsForApi<TApi extends Api>(
 					maxTokensExplicit: rawOptions?.maxTokens !== undefined,
 					disableReasoning: options?.disableReasoning,
 					textVerbosity: options?.textVerbosity,
+					promptCache: options?.promptCache,
+					statefulResponses: options?.statefulResponses,
 				});
 			}
 			return castApi<"openai-completions">({
@@ -1589,6 +1625,7 @@ function mapOptionsForApi<TApi extends Api>(
 				serviceTier: options?.serviceTier,
 				openrouterVariant: options?.openrouterVariant,
 				maxTokensExplicit: rawOptions?.maxTokens !== undefined,
+				promptCache: options?.promptCache,
 			});
 		}
 
@@ -1601,6 +1638,7 @@ function mapOptionsForApi<TApi extends Api>(
 				serviceTier: options?.serviceTier,
 				openrouterVariant: options?.openrouterVariant,
 				maxTokensExplicit: rawOptions?.maxTokens !== undefined,
+				promptCache: options?.promptCache,
 			});
 
 		case "openai-responses":
@@ -1614,6 +1652,8 @@ function mapOptionsForApi<TApi extends Api>(
 				maxTokensExplicit: rawOptions?.maxTokens !== undefined,
 				disableReasoning: options?.disableReasoning,
 				textVerbosity: options?.textVerbosity,
+				promptCache: options?.promptCache,
+				statefulResponses: options?.statefulResponses,
 			});
 
 		case "azure-openai-responses":
@@ -1623,6 +1663,8 @@ function mapOptionsForApi<TApi extends Api>(
 				toolChoice: mapOpenAiToolChoice(options?.toolChoice),
 				serviceTier: options?.serviceTier,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
+				promptCache: options?.promptCache,
+				statefulResponses: options?.statefulResponses,
 			});
 
 		case "openai-codex-responses":
@@ -1632,6 +1674,7 @@ function mapOptionsForApi<TApi extends Api>(
 				toolChoice: mapOpenAiToolChoice(options?.toolChoice),
 				serviceTier: options?.serviceTier,
 				preferWebsockets: options?.preferWebsockets,
+				codexCompaction: options?.codexCompaction,
 				reasoningSummary: options?.hideThinkingSummary ? null : "detailed",
 				textVerbosity: options?.textVerbosity,
 			});
@@ -1646,6 +1689,7 @@ function mapOptionsForApi<TApi extends Api>(
 					serviceTier: options?.serviceTier,
 					thinking: { enabled: false },
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
@@ -1664,10 +1708,11 @@ function mapOptionsForApi<TApi extends Api>(
 					},
 					hideThinkingSummary: options?.hideThinkingSummary,
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
-			return castApi<"google-gemini-cli">({
+			return castApi<"google-generative-ai">({
 				...base,
 				thinking: {
 					enabled: true,
@@ -1675,6 +1720,7 @@ function mapOptionsForApi<TApi extends Api>(
 				},
 				hideThinkingSummary: options?.hideThinkingSummary,
 				toolChoice: mapGoogleToolChoice(options?.toolChoice),
+				cachedContent: options?.cachedContent,
 			});
 		}
 
@@ -1748,6 +1794,7 @@ function mapOptionsForApi<TApi extends Api>(
 					serviceTier: options?.serviceTier,
 					thinking: { enabled: false },
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
@@ -1765,6 +1812,7 @@ function mapOptionsForApi<TApi extends Api>(
 					},
 					hideThinkingSummary: options?.hideThinkingSummary,
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
@@ -1777,6 +1825,7 @@ function mapOptionsForApi<TApi extends Api>(
 				},
 				hideThinkingSummary: options?.hideThinkingSummary,
 				toolChoice: mapGoogleToolChoice(options?.toolChoice),
+				cachedContent: options?.cachedContent,
 			});
 		}
 
@@ -1841,7 +1890,9 @@ function getGoogleBudget(
 				return 2048;
 			case "medium":
 				return 8192;
-			default:
+			case "high":
+			case "xhigh":
+			case "max":
 				return model.id.includes("2.5-flash") ? 24576 : 32768;
 		}
 	}

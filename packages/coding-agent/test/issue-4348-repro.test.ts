@@ -47,8 +47,6 @@ function transcriptWith(messages: AgentMessage[]): SessionContext {
 		serviceTier: undefined,
 		models: {},
 		injectedTtsrRules: [],
-		selectedMCPToolNames: [],
-		hasPersistedMCPToolSelection: false,
 		mode: "none",
 	};
 }
@@ -61,6 +59,7 @@ function makeRenderCtx(transcript: SessionContext): { ctx: InteractiveModeContex
 		pendingMessagesContainer: new Container(),
 		pendingBashComponents: [],
 		pendingPythonComponents: [],
+		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		statusLine: { invalidate: vi.fn() },
 		updateEditorBorderColor: vi.fn(),

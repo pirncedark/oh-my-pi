@@ -382,12 +382,17 @@ describe("Anthropic request fingerprint alignment", () => {
 		// cache window (the Continue. pad is appended after it) but must not get
 		// a breakpoint — Anthropic rejects cache_control on thinking blocks.
 		const assistant = payload.messages?.find(message => message.role === "assistant");
-		expect(Array.isArray(assistant?.content)).toBe(true);
-		for (const block of assistant?.content as Array<{ type: string; cache_control?: unknown }>) {
+		expect(assistant).toBeDefined();
+		const assistantContent = assistant?.content;
+		expect(Array.isArray(assistantContent)).toBe(true);
+		for (const block of (assistantContent ?? []) as Array<{ type: string; cache_control?: unknown }>) {
 			expect(block.cache_control).toBeUndefined();
 		}
 		const last = payload.messages?.at(-1);
-		expect((last?.content as Array<{ cache_control?: unknown }>)[0]?.cache_control).toBeDefined();
+		expect(last).toBeDefined();
+		const lastContent = last?.content;
+		expect(Array.isArray(lastContent)).toBe(true);
+		expect((lastContent as Array<{ cache_control?: unknown }>)[0]?.cache_control).toBeDefined();
 	});
 
 	it("adds effort and mid-conversation betas to API-key requests that use those features", async () => {
@@ -420,6 +425,100 @@ describe("Anthropic request fingerprint alignment", () => {
 		// both fields need their betas on API-key requests too.
 		expect(capturedBeta).toContain("effort-2025-11-24");
 		expect(capturedBeta).toContain("mid-conversation-system-2026-04-07");
+	});
+
+	it("adds the extended-cache-ttl beta to API-key requests that default to 1h caching", async () => {
+		const captureBeta = () => {
+			let captured: string | undefined;
+			const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+				captured = (init?.headers as Record<string, string> | undefined)?.["anthropic-beta"];
+				return new Response(
+					JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
+					{ status: 400, headers: { "Content-Type": "application/json" } },
+				);
+			}) as typeof fetch;
+			return { fetchMock, beta: () => captured ?? "" };
+		};
+		const cacheContext: Context = {
+			systemPrompt: ["Stay concise."],
+			messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+		};
+
+		const canonical = captureBeta();
+		await streamAnthropic(ANTHROPIC_MODEL, cacheContext, {
+			apiKey: "sk-ant-api-test",
+			fetch: canonical.fetchMock,
+		}).result();
+		expect(canonical.beta()).toContain("extended-cache-ttl-2025-04-11");
+
+		// Endpoints without long-cache support never send `ttl: "1h"`, so the
+		// companion beta must stay off the wire too.
+		const proxy = captureBeta();
+		await streamAnthropic(UMANS_ANTHROPIC_MODEL, cacheContext, {
+			apiKey: "sk-umans-test",
+			fetch: proxy.fetchMock,
+		}).result();
+		expect(proxy.beta()).not.toContain("extended-cache-ttl-2025-04-11");
+	});
+
+	it("gates the effort beta and field off google-vertex requests (#5614)", async () => {
+		let capturedBeta: string | undefined;
+		let capturedBody:
+			| {
+					output_config?: { effort?: unknown };
+					fallbacks?: Array<{
+						model: string;
+						max_tokens?: number;
+						output_config?: { effort?: unknown };
+					}>;
+			  }
+			| undefined;
+		const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+			capturedBeta = (init?.headers as Record<string, string> | undefined)?.["anthropic-beta"];
+			capturedBody = JSON.parse(String(init?.body ?? "{}"));
+			return new Response(
+				JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
+				{ status: 400, headers: { "Content-Type": "application/json" } },
+			);
+		}) as typeof fetch;
+		// Claude on Vertex uses api "anthropic-messages" and the rawPredict adapter,
+		// which rejects any `anthropic-beta` HTTP header value it doesn't understand.
+		// The effort beta must ride the body (`anthropic_beta`) instead — since this
+		// path can't deliver it there, primary and fallback effort fields are dropped.
+		const vertexModel: Model<"anthropic-messages"> = buildModel({
+			...ANTHROPIC_MODEL_SPEC,
+			id: "claude-haiku-4-5@20260101",
+			name: "Claude Haiku via Vertex",
+			provider: "google-vertex",
+			baseUrl:
+				"https://us-east5-aiplatform.googleapis.com/v1/projects/p/locations/us-east5/publishers/anthropic/models/claude-haiku-4-5:rawPredict",
+			thinking: {
+				mode: "anthropic-adaptive",
+				efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+			},
+		});
+
+		await streamAnthropic(
+			vertexModel,
+			{ systemPrompt: ["Stay concise."], messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
+			{
+				apiKey: "vertex-adc",
+				thinkingEnabled: true,
+				effort: "high",
+				fetch: fetchMock,
+				fallbacks: [
+					{
+						model: "claude-sonnet-4-6@20260101",
+						max_tokens: 4_096,
+						output_config: { effort: "high" },
+					},
+				],
+			},
+		).result();
+
+		expect(capturedBeta ?? "").not.toContain("effort-2025-11-24");
+		expect(capturedBody?.output_config?.effort).toBeUndefined();
+		expect(capturedBody?.fallbacks).toEqual([{ model: "claude-sonnet-4-6@20260101", max_tokens: 4_096 }]);
 	});
 
 	it("adds the context-management beta to API-key thinking requests", async () => {
@@ -499,7 +598,8 @@ describe("Anthropic request fingerprint alignment", () => {
 
 		expect(payload.system).toEqual([
 			{ type: "text", text: "stable system" },
-			{ type: "text", text: "stable durable context", cache_control: { type: "ephemeral" } },
+			// Canonical Anthropic API-key requests default to the 1h breakpoint.
+			{ type: "text", text: "stable durable context", cache_control: { type: "ephemeral", ttl: "1h" } },
 		]);
 	});
 
@@ -575,6 +675,48 @@ describe("Anthropic request fingerprint alignment", () => {
 		});
 
 		expect(headers.Authorization).toBe("Bearer sk-ant-oat-test");
+	});
+
+	it("honors opted-in OAuth fingerprint headers on non-official endpoints (#5888)", () => {
+		const options = buildAnthropicClientOptions({
+			model: buildModel({
+				...ANTHROPIC_MODEL_SPEC,
+				provider: "custom-anthropic",
+				baseUrl: "https://proxy.example.com/anthropic",
+				headers: {
+					"anthropic-beta": "custom-beta-token",
+					"x-app": "custom-app-token",
+					"X-Stainless-Runtime-Version": "custom-runtime-token",
+					Authorization: "should-not-leak",
+				},
+				compat: { allowAnthropicHeaderOverrides: true },
+			}),
+			apiKey: "sk-ant-oat-test",
+			stream: true,
+		});
+
+		expect(options.defaultHeaders["anthropic-beta"]).toBe("custom-beta-token");
+		expect(options.defaultHeaders["x-app"]).toBe("custom-app-token");
+		expect(options.defaultHeaders["X-Stainless-Runtime-Version"]).toBe("custom-runtime-token");
+		expect(options.defaultHeaders.Authorization).toBe("Bearer sk-ant-oat-test");
+	});
+
+	it("keeps OAuth fingerprint defaults on official endpoints despite the compat opt-in", () => {
+		const headers = buildAnthropicHeaders({
+			apiKey: "sk-ant-oat-test",
+			baseUrl: "https://api.anthropic.com",
+			isOAuth: true,
+			allowAnthropicHeaderOverrides: true,
+			modelHeaders: {
+				"anthropic-beta": "custom-beta-token",
+				"x-app": "custom-app-token",
+				"X-Stainless-Runtime-Version": "custom-runtime-token",
+			},
+		});
+
+		expect(headers["anthropic-beta"]).not.toBe("custom-beta-token");
+		expect(headers["x-app"]).toBe("cli");
+		expect(headers["X-Stainless-Runtime-Version"]).toBe("v24.3.0");
 	});
 
 	it("suppresses the client-level X-Api-Key when model.headers carries a custom Authorization (#3391)", () => {
@@ -1677,13 +1819,14 @@ describe("Anthropic request fingerprint alignment", () => {
 				FOUNDRY_BASE_URL: "https://foundry.example.com/anthropic/",
 				ANTHROPIC_CUSTOM_HEADERS: "user-id: alice, x-route: engineering",
 			},
-			() => {
+			async () => {
 				const options = buildAnthropicClientOptions({
 					model: ANTHROPIC_MODEL,
 					apiKey: "foundry-token",
 					extraBetas: [],
 					stream: true,
 					interleavedThinking: false,
+					hasTools: true,
 					dynamicHeaders: {},
 				});
 
@@ -1692,6 +1835,24 @@ describe("Anthropic request fingerprint alignment", () => {
 				expect(options.defaultHeaders["X-Api-Key"]).toBeUndefined();
 				expect(options.defaultHeaders["user-id"]).toBe("alice");
 				expect(options.defaultHeaders["x-route"]).toBe("engineering");
+				expect(options.defaultHeaders["anthropic-beta"] ?? "").not.toContain(
+					"fine-grained-tool-streaming-2025-05-14",
+				);
+
+				const payload = await captureAnthropicPayload(ANTHROPIC_MODEL, {
+					systemPrompt: ["Stay concise."],
+					messages: [{ role: "user", content: "Hi", timestamp: 0 }],
+					tools: [
+						{
+							name: "ping",
+							description: "ping",
+							parameters: { type: "object", properties: {}, additionalProperties: false },
+						},
+					],
+				});
+				expect(payload).toMatchObject({
+					tools: [expect.not.objectContaining({ eager_input_streaming: expect.anything() })],
+				});
 			},
 		);
 	});
@@ -1939,16 +2100,17 @@ describe("Anthropic request fingerprint alignment", () => {
 	});
 
 	it("drops sampling params and keeps summarized adaptive thinking for OAuth Opus 4.7+", async () => {
+		const opus47 = buildModel({
+			...ANTHROPIC_MODEL_SPEC,
+			id: "claude-opus-4-7",
+			name: "Claude Opus 4.7",
+			thinking: {
+				mode: "anthropic-adaptive",
+				efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
+			},
+		});
 		const payload = (await captureAnthropicPayload(
-			buildModel({
-				...ANTHROPIC_MODEL_SPEC,
-				id: "claude-opus-4-7",
-				name: "Claude Opus 4.7",
-				thinking: {
-					mode: "anthropic-adaptive",
-					efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
-				},
-			}),
+			opus47,
 			{
 				systemPrompt: ["Stay concise."],
 				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
@@ -1976,18 +2138,10 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.context_management).toEqual({
 			edits: [{ type: "clear_thinking_20251015", keep: "all" }],
 		});
-		expect(payload.output_config).toEqual({ effort: "xhigh" });
+		expect(payload.output_config).toEqual({ effort: "high" });
 
-		const maxPayload = (await captureAnthropicPayload(
-			buildModel({
-				...ANTHROPIC_MODEL_SPEC,
-				id: "claude-opus-4-7",
-				name: "Claude Opus 4.7",
-				thinking: {
-					mode: "anthropic-adaptive",
-					efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
-				},
-			}),
+		const xhighPayload = (await captureAnthropicPayload(
+			opus47,
 			{
 				systemPrompt: ["Stay concise."],
 				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
@@ -1995,6 +2149,23 @@ describe("Anthropic request fingerprint alignment", () => {
 			{
 				thinkingEnabled: true,
 				reasoning: Effort.XHigh,
+			},
+		)) as {
+			thinking?: { type?: string; display?: string };
+			output_config?: { effort?: string };
+		};
+		expect(xhighPayload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(xhighPayload.output_config).toEqual({ effort: "xhigh" });
+
+		const maxPayload = (await captureAnthropicPayload(
+			opus47,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{
+				thinkingEnabled: true,
+				reasoning: Effort.Max,
 			},
 		)) as {
 			thinking?: { type?: string; display?: string };
@@ -2014,15 +2185,14 @@ describe("Anthropic request fingerprint alignment", () => {
 				baseUrl: "https://api.code.umans.ai",
 				thinking: {
 					mode: "anthropic-budget-effort",
-					efforts: [Effort.High, Effort.XHigh],
-					effortMap: { [Effort.XHigh]: "max" },
+					efforts: [Effort.High, Effort.Max],
 				},
 			}),
 			{
 				systemPrompt: ["Stay concise."],
 				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
 			},
-			Effort.XHigh,
+			Effort.Max,
 		)) as {
 			thinking?: { type?: string; budget_tokens?: number };
 			output_config?: { effort?: string };
@@ -2098,7 +2268,7 @@ describe("Anthropic request fingerprint alignment", () => {
 				name: "Claude Opus 4.7",
 				thinking: {
 					mode: "anthropic-adaptive",
-					efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+					efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
 				},
 			}),
 			{
@@ -2120,7 +2290,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.context_management).toEqual({
 			edits: [{ type: "clear_thinking_20251015", keep: "all" }],
 		});
-		expect(payload.output_config).toEqual({ effort: "xhigh" });
+		expect(payload.output_config).toEqual({ effort: "high" });
 	});
 
 	it("sends task budgets through Anthropic output_config without dropping adaptive effort", async () => {
@@ -2131,7 +2301,7 @@ describe("Anthropic request fingerprint alignment", () => {
 				name: "Claude Opus 4.7",
 				thinking: {
 					mode: "anthropic-adaptive",
-					efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+					efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
 				},
 			}),
 			{
@@ -2151,7 +2321,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		};
 
 		expect(payload.output_config).toEqual({
-			effort: "xhigh",
+			effort: "high",
 			task_budget: { type: "tokens", total: 64_000, remaining: 48_000 },
 		});
 	});
@@ -2164,7 +2334,7 @@ describe("Anthropic request fingerprint alignment", () => {
 				name: "Claude Opus 4.7",
 				thinking: {
 					mode: "anthropic-adaptive",
-					efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+					efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
 				},
 			}),
 			{
@@ -2209,7 +2379,7 @@ describe("Anthropic request fingerprint alignment", () => {
 					maxTokens: 128_000,
 					thinking: {
 						mode: "anthropic-adaptive",
-						efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh],
+						efforts: [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max],
 					},
 				}),
 				{
@@ -2236,7 +2406,7 @@ describe("Anthropic request fingerprint alignment", () => {
 
 			expect(payload.tool_choice).toEqual({ type: "auto" });
 			expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
-			expect(payload.output_config).toEqual({ effort: "xhigh" });
+			expect(payload.output_config).toEqual({ effort: "high" });
 		}
 	});
 

@@ -116,7 +116,16 @@ async function captureRepoBaseline(repoRoot: string): Promise<RepoBaseline> {
 	return { repoRoot, headCommit, staged, unstaged, untracked, untrackedPatch };
 }
 
-async function writeSyntheticTree(repoDir: string, baseTreeish: string, patches: readonly string[]): Promise<string> {
+interface SyntheticTreeOptions {
+	readonly threeWay?: boolean;
+}
+
+async function writeSyntheticTree(
+	repoDir: string,
+	baseTreeish: string,
+	patches: readonly string[],
+	options: SyntheticTreeOptions = {},
+): Promise<string> {
 	const tempIndex = path.join(os.tmpdir(), `omp-task-index-${Snowflake.next()}`);
 	try {
 		await git.readTree(repoDir, baseTreeish, {
@@ -127,6 +136,7 @@ async function writeSyntheticTree(repoDir: string, baseTreeish: string, patches:
 			await git.patch.applyText(repoDir, patch, {
 				cached: true,
 				env: { GIT_INDEX_FILE: tempIndex },
+				threeWay: options.threeWay,
 			});
 		}
 		return await git.writeTree(repoDir, {
@@ -414,6 +424,8 @@ export async function ensureIsolation(
 	preferred?: IsoBackendKind,
 ): Promise<IsolationHandle> {
 	const repoRoot = await getRepoRoot(baseCwd);
+	const repository = await git.repo.resolve(repoRoot);
+	const sourceCommonDir = repository?.commonDir ?? path.join(repoRoot, ".git");
 	const baseDir = getWorktreeDir(getTaskIsolationSegment(repoRoot, id));
 	const mergedDir = path.join(baseDir, TASK_ISOLATION_MOUNT_DIR);
 	const resolution = natives.isoResolve(preferred ?? null);
@@ -424,6 +436,14 @@ export async function ensureIsolation(
 		await fs.rm(baseDir, { recursive: true, force: true });
 		try {
 			await natives.isoStart(candidate, repoRoot, mergedDir);
+			// Sever the isolation's git metadata from the source checkout. Copy
+			// backends duplicate `repoRoot`'s `.git` verbatim — a linked-worktree
+			// pointer file (or the rcopy `git worktree add` registration) leaves
+			// the isolation sharing the source's HEAD/index/ref namespace, so a
+			// task's git operations would mutate the parent checkout and stack
+			// parallel task branches. Detaching gives each isolation a private,
+			// frozen repo that still borrows the source object DB via alternates.
+			await git.detachGitDir(mergedDir, sourceCommonDir);
 			return {
 				mergedDir,
 				backend: candidate,
@@ -643,11 +663,12 @@ async function replayFilteredAgentCommits(opts: FilteredAgentReplayOptions): Pro
 	try {
 		await git.worktree.add(opts.repoRoot, tmpDir, opts.branchName);
 		const agentCommits = await git.revList.range(opts.isolationDir, baselineSha, opts.isolationHead);
-		const dirtyBaselineTree = await writeSyntheticTree(opts.isolationDir, baselineSha, [
-			opts.baseline.root.staged,
-			opts.baseline.root.unstaged,
-			opts.baseline.root.untrackedPatch,
-		]);
+		const baselineWip = [opts.baseline.root.staged, opts.baseline.root.unstaged, opts.baseline.root.untrackedPatch];
+		// Seed the parent ODB with the dirty-side blobs needed by `git apply
+		// --3way`. Isolation repositories can read parent objects, but the parent
+		// cannot read objects created only inside isolation.
+		await writeSyntheticTree(opts.repoRoot, baselineSha, baselineWip);
+		const dirtyBaselineTree = await writeSyntheticTree(opts.isolationDir, baselineSha, baselineWip);
 		let previousFilteredTree = baselineSha;
 		let filteredCommitsApplied = 0;
 
@@ -656,7 +677,9 @@ async function replayFilteredAgentCommits(opts: FilteredAgentReplayOptions): Pro
 				allowFailure: true,
 				binary: true,
 			});
-			const currentFilteredTree = await writeSyntheticTree(opts.repoRoot, baselineSha, [taskStatePatch]);
+			const currentFilteredTree = await writeSyntheticTree(opts.repoRoot, baselineSha, [taskStatePatch], {
+				threeWay: true,
+			});
 			const commitPatch = await git.diff.tree(opts.repoRoot, previousFilteredTree, currentFilteredTree, {
 				allowFailure: true,
 				binary: true,
@@ -689,10 +712,11 @@ async function replayFilteredAgentCommits(opts: FilteredAgentReplayOptions): Pro
 				await commitPatchToBranchWorktree(tmpDir, opts.taskId, opts.rootPatch, msg, undefined, opts.baseline.root);
 			}
 		} else {
-			// A filtered commit landed; tmpDir has advanced past baselineSha and
-			// previousFilteredTree is HEAD-derived, so writeSyntheticTree +
-			// leftoverPatch stay HEAD-based and no WIP seed is needed.
-			const finalFilteredTree = await writeSyntheticTree(opts.repoRoot, baselineSha, [opts.rootPatch]);
+			// A filtered commit landed; reconstruct the final HEAD-derived tree
+			// with the same dirty-side blobs and 3-way synthesis used above.
+			const finalFilteredTree = await writeSyntheticTree(opts.repoRoot, baselineSha, [opts.rootPatch], {
+				threeWay: true,
+			});
 			const leftoverPatch = await git.diff.tree(opts.repoRoot, previousFilteredTree, finalFilteredTree, {
 				allowFailure: true,
 				binary: true,

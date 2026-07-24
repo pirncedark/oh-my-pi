@@ -11,6 +11,7 @@ import { ollamaCloudModelManagerOptions } from "./ollama";
 import {
 	aimlApiModelManagerOptions,
 	alibabaCodingPlanModelManagerOptions,
+	alibabaTokenPlanModelManagerOptions,
 	anthropicModelManagerOptions,
 	basetenModelManagerOptions,
 	cerebrasModelManagerOptions,
@@ -26,9 +27,11 @@ import {
 	kimiCodeModelManagerOptions,
 	litellmModelManagerOptions,
 	lmStudioModelManagerOptions,
+	metaModelManagerOptions,
 	mistralModelManagerOptions,
 	moonshotModelManagerOptions,
 	nanoGptModelManagerOptions,
+	novitaModelManagerOptions,
 	nvidiaModelManagerOptions,
 	ollamaModelManagerOptions,
 	openaiModelManagerOptions,
@@ -73,6 +76,14 @@ export const CATALOG_PROVIDERS = [
 		envVars: ["ALIBABA_CODING_PLAN_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => alibabaCodingPlanModelManagerOptions(config),
 		catalogDiscovery: { label: "Alibaba Coding Plan" },
+	},
+	{
+		id: "alibaba-token-plan",
+		defaultModel: "qwen3.7-plus",
+		envVars: ["ALIBABA_TOKEN_PLAN_API_KEY", "BAILIAN_TOKEN_PLAN_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => alibabaTokenPlanModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+		catalogDiscovery: { label: "QwenCloud Token Plan" },
 	},
 	{
 		id: "baseten",
@@ -249,6 +260,13 @@ export const CATALOG_PROVIDERS = [
 		createModelManagerOptions: (config: ModelManagerConfig) => mistralModelManagerOptions(config),
 	},
 	{
+		id: "meta",
+		defaultModel: "muse-spark-1.1",
+		envVars: ["MODEL_API_KEY", "META_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => metaModelManagerOptions(config),
+		catalogDiscovery: { label: "Meta Model API" },
+	},
+	{
 		id: "moonshot",
 		defaultModel: "kimi-k2.7-code",
 		// KIMI_API_KEY is the most intuitive name for a Kimi/Moonshot key; accept it
@@ -270,6 +288,14 @@ export const CATALOG_PROVIDERS = [
 		envVars: ["NVIDIA_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => nvidiaModelManagerOptions(config),
 		catalogDiscovery: { label: "NVIDIA" },
+	},
+	{
+		id: "novita",
+		defaultModel: "moonshotai/kimi-k2.7-code",
+		envVars: ["NOVITA_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => novitaModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+		catalogDiscovery: { label: "Novita", allowUnauthenticated: true },
 	},
 	{
 		id: "ollama",
@@ -302,12 +328,14 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "kimi-k2.7-code",
 		envVars: ["OPENCODE_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => opencodeGoModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 	},
 	{
 		id: "opencode-zen",
 		defaultModel: "claude-opus-4-8",
 		envVars: ["OPENCODE_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => opencodeZenModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 	},
 	{
 		id: "openrouter",

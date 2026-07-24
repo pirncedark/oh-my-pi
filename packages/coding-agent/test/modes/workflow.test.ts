@@ -13,23 +13,28 @@ beforeAll(() => {
 });
 
 describe("workflow keyword detection", () => {
-	it("matches the lowercase trigger word delimited by whitespace", () => {
+	it("matches the lowercase trigger word delimited by whitespace or a string edge", () => {
 		expect(containsWorkflow("workflowz")).toBe(true);
 		expect(containsWorkflow("please workflowz this rollout")).toBe(true);
 		expect(containsWorkflow("design the workflowz")).toBe(true);
 		expect(containsWorkflow("run these workflowz")).toBe(true);
 	});
 
-	it("ignores old triggers, casing, inflections, punctuation-adjacent, and path-embedded forms", () => {
+	it("matches the lowercase trigger word beside prose punctuation and quotes", () => {
+		for (const text of ["do it. workflowz.", "please workflowz, then report", 'say "workflowz" now']) {
+			expect(containsWorkflow(text)).toBe(true);
+		}
+	});
+
+	it("ignores old triggers, casing, inflections, and path-embedded forms", () => {
 		expect(containsWorkflow("workflow")).toBe(false);
 		expect(containsWorkflow("workflows")).toBe(false);
 		expect(containsWorkflow("Workflowz")).toBe(false);
 		expect(containsWorkflow("WORKFLOWZ")).toBe(false);
 		expect(containsWorkflow("workflowzed the build")).toBe(false);
 		expect(containsWorkflow("reworkflowz everything")).toBe(false);
-		// A path/extension is not whitespace, so the word never triggers.
+		// A path/extension must not trigger even though sentence punctuation does.
 		expect(containsWorkflow("packages/coding-agent/test/modes/workflowz.test.ts")).toBe(false);
-		expect(containsWorkflow("do it. workflowz.")).toBe(false);
 		expect(containsWorkflow("nothing to see here")).toBe(false);
 	});
 });
@@ -43,8 +48,15 @@ describe("workflow keyword highlighting", () => {
 		expect(Bun.stripANSI(decorated)).toBe(input);
 	});
 
+	it("decorates punctuation-adjacent prose while preserving visible text", () => {
+		const input = 'please "workflowz," then continue';
+		const decorated = highlightWorkflow(input);
+		expect(decorated).not.toBe(input);
+		expect(Bun.stripANSI(decorated)).toBe(input);
+	});
+
 	it("leaves text without the standalone keyword untouched", () => {
-		// Probe hits the substring but the whitespace boundary fails — no decoration.
+		// Probe hits the substring but token/path boundaries fail — no decoration.
 		expect(highlightWorkflow("workflowzed builds")).toBe("workflowzed builds");
 		expect(highlightWorkflow("Workflowz this")).toBe("Workflowz this");
 		const filePath = "packages/coding-agent/test/modes/workflowz.test.ts";
@@ -53,18 +65,23 @@ describe("workflow keyword highlighting", () => {
 });
 
 describe("workflow notice", () => {
-	it("is a non-empty system notice carrying the task fan-out contract", () => {
-		expect(WORKFLOW_NOTICE.length).toBeGreaterThan(0);
+	it("renders the Workflowz trigger with eval orchestration helper guidance", () => {
 		expect(WORKFLOW_NOTICE).toContain("**workflowz** keyword");
-		expect(WORKFLOW_NOTICE).toContain("Use the `task` tool for batched fan-out");
-		expect(WORKFLOW_NOTICE).toContain("tasks[]");
+		expect(WORKFLOW_NOTICE).toContain("Author the orchestration in the `eval` tool");
+		expect(WORKFLOW_NOTICE).toContain("JavaScript (`eval`, JavaScript backend):");
+		expect(WORKFLOW_NOTICE).toContain("Use ordinary code between calls to flatten/map/filter");
+		expect(WORKFLOW_NOTICE).toContain("State persists across eval calls");
+		expect(WORKFLOW_NOTICE).toContain("`parallel(thunks)`");
+		expect(WORKFLOW_NOTICE).toContain("a negative value disables the cap");
+		expect(WORKFLOW_NOTICE).toContain("await budget.remaining()");
 	});
 
-	it("renders flat task-call guidance when task.batch is disabled", () => {
+	it("renders the same eval notice when task.batch is disabled", () => {
 		const notice = renderWorkflowNotice({ taskBatch: false });
-		expect(notice).toContain("once per independent subagent");
-		expect(notice).toContain("Do not pass `context` or `tasks[]`");
-		expect(notice).toContain("one independent task call per leaf");
-		expect(notice).not.toContain("Call `task` once per independent fan-out batch");
+		expect(notice).toContain("**workflowz** keyword");
+		expect(notice).toContain("Author the orchestration in the `eval` tool");
+		expect(notice).toContain("JavaScript (`eval`, JavaScript backend):");
+		expect(notice).toContain("State persists across eval calls");
+		expect(notice).toContain("`parallel(thunks)`");
 	});
 });

@@ -3,22 +3,17 @@ import hashlineGrammar from "@oh-my-pi/hashline/grammar.lark" with { type: "text
 import hashlineDescription from "@oh-my-pi/hashline/prompt.md" with { type: "text" };
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
-import { prompt } from "@oh-my-pi/pi-utils";
-import {
-	createLspWritethrough,
-	type FileDiagnosticsResult,
-	flushLspWritethroughBatch,
-	type WritethroughCallback,
-	type WritethroughDeferredHandle,
-	writethroughNoop,
-} from "../lsp";
+import { isEnoent, isEnotdir, prompt } from "@oh-my-pi/pi-utils";
+import { createLspWritethrough, flushLspWritethroughBatch, type WritethroughCallback, writethroughNoop } from "../lsp";
+import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 import applyPatchDescription from "../prompts/tools/apply-patch.md" with { type: "text" };
 import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
 import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
-import type { DeferredDiagnosticsEntry, ToolSession } from "../tools";
+import type { ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
-import { isInternalUrlPath } from "../tools/path-utils";
+import { findUniqueWorkspaceSuffix, isInternalUrlPath } from "../tools/path-utils";
+import { resolvePlanPath } from "../tools/plan-mode-guard";
 import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
 import { executeHashlineSingle, hashlineEditParamsSchema } from "./hashline";
 import { type ApplyPatchParams, applyPatchSchema, expandApplyPatchToEntries } from "./modes/apply-patch";
@@ -77,6 +72,24 @@ function resolveConfiguredEditMode(rawEditMode: string): EditMode | undefined {
 	}
 
 	return editMode;
+}
+
+async function resolveEditPath(
+	session: ToolSession,
+	authoredPath: string,
+	options: { mustExist: boolean; signal?: AbortSignal },
+): Promise<string> {
+	if (!options.mustExist || isInternalUrlPath(authoredPath)) return authoredPath;
+
+	try {
+		await Bun.file(resolvePlanPath(session, authoredPath)).stat();
+		return authoredPath;
+	} catch (error) {
+		if (!isEnoent(error) && !isEnotdir(error)) throw error;
+	}
+
+	const match = await findUniqueWorkspaceSuffix(authoredPath, session.cwd, options.signal);
+	return match?.displayPath ?? authoredPath;
 }
 
 function resolveAllowFuzzy(session: ToolSession, rawValue: string): boolean {
@@ -384,12 +397,7 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #fuzzyThreshold: number;
 	readonly #writethrough: WritethroughCallback;
 	readonly #editMode?: EditMode;
-	readonly #dedupDiagnostics: boolean;
-	readonly #pendingDeferredFetches = new Map<string, AbortController>();
-	/** Fallback per-path mutation counter used only when the session does not expose
-	 *  a shared one. Prefer `session.bumpFileMutationVersion` so write (and any other
-	 *  tool) mutating the same file also invalidates pending late-diagnostics. */
-	readonly #editVersionByPath = new Map<string, number>();
+	readonly #deferredDiagnostics: DeferredDiagnostics;
 
 	constructor(private readonly session: ToolSession) {
 		const {
@@ -401,10 +409,11 @@ export class EditTool implements AgentTool<TInput> {
 		this.#editMode = resolveConfiguredEditMode(envEditVariant);
 		this.#allowFuzzy = resolveAllowFuzzy(session, editFuzzy);
 		this.#fuzzyThreshold = resolveFuzzyThreshold(session, editFuzzyThreshold);
-		this.#dedupDiagnostics =
+		const deduplicateDiagnostics =
 			(session.enableLsp ?? true) &&
 			session.settings.get("lsp.diagnosticsOnEdit") &&
 			session.settings.get("lsp.diagnosticsDeduplicate");
+		this.#deferredDiagnostics = new DeferredDiagnostics(session, deduplicateDiagnostics);
 		this.#writethrough = createEditWritethrough(session);
 	}
 
@@ -527,7 +536,7 @@ export class EditTool implements AgentTool<TInput> {
 						note: "All entries in one call apply to the top-level `path`; use separate calls for different files.",
 					},
 				] satisfies readonly ToolExample<PatchParams>[],
-				execute: (
+				execute: async (
 					tool: EditTool,
 					params: EditParams,
 					signal: AbortSignal | undefined,
@@ -535,11 +544,15 @@ export class EditTool implements AgentTool<TInput> {
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
 					const { edits, path } = params as PatchParams;
+					const targetPath = await resolveEditPath(tool.session, path, {
+						mustExist: (edits[0]?.op ?? "update") !== "create",
+						signal,
+					});
 					const runs = (edits as PatchEditEntry[]).map(
 						entry => (br: LspBatchRequest | undefined) =>
 							executePatchSingle({
 								session: tool.session,
-								path,
+								path: targetPath,
 								params: entry,
 								signal,
 								batchRequest: br,
@@ -549,10 +562,10 @@ export class EditTool implements AgentTool<TInput> {
 								// doubles as the documented full-file overwrite (patch.md <avoid>).
 								allowCreateOverwrite: true,
 								writethrough: tool.#writethrough,
-								beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
+								beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
 							}),
 					);
-					return executeSinglePathEntries(path, runs, batchRequest, onUpdate, tool.session.cwd, signal);
+					return executeSinglePathEntries(targetPath, runs, batchRequest, onUpdate, tool.session.cwd, signal);
 				},
 			},
 			apply_patch: {
@@ -574,22 +587,35 @@ export class EditTool implements AgentTool<TInput> {
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
 					const entries = expandApplyPatchToEntries(params as ApplyPatchParams);
+					// Resolve each authored path once per patch so paired hunks (e.g. delete
+					// then re-add of the same file) share the same workspace target.
+					const resolvedTargets = new Map<string, Promise<string>>();
+					const resolveOnce = (path: string, mustExist: boolean): Promise<string> => {
+						let pending = resolvedTargets.get(path);
+						if (!pending) {
+							pending = resolveEditPath(tool.session, path, { mustExist, signal });
+							resolvedTargets.set(path, pending);
+						}
+						return pending;
+					};
 					const perFile = entries.map(entry => {
 						const { path, ...patchParams } = entry;
 						return {
 							path,
-							run: (br: LspBatchRequest | undefined) =>
-								executePatchSingle({
+							run: async (br: LspBatchRequest | undefined) => {
+								const targetPath = await resolveOnce(path, patchParams.op !== "create");
+								return executePatchSingle({
 									session: tool.session,
-									path,
+									path: targetPath,
 									params: patchParams,
 									signal,
 									batchRequest: br,
 									allowFuzzy: tool.#allowFuzzy,
 									fuzzyThreshold: tool.#fuzzyThreshold,
 									writethrough: tool.#writethrough,
-									beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
-								}),
+									beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
+								});
+							},
 						};
 					});
 					return executeApplyPatchPerFile(perFile, batchRequest, tool.session.cwd, signal, onUpdate);
@@ -612,14 +638,14 @@ export class EditTool implements AgentTool<TInput> {
 						signal,
 						batchRequest,
 						writethrough: tool.#writethrough,
-						beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
+						beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
 					});
 				},
 			},
 			replace: {
 				description: () => prompt.render(replaceDescription),
 				parameters: replaceEditSchema,
-				execute: (
+				execute: async (
 					tool: EditTool,
 					params: EditParams,
 					signal: AbortSignal | undefined,
@@ -627,79 +653,24 @@ export class EditTool implements AgentTool<TInput> {
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 				) => {
 					const { edits, path } = params as ReplaceParams;
+					const targetPath = await resolveEditPath(tool.session, path, { mustExist: true, signal });
 					const runs = (edits as ReplaceEditEntry[]).map(
 						entry => (br: LspBatchRequest | undefined) =>
 							executeReplaceSingle({
 								session: tool.session,
-								path,
+								path: targetPath,
 								params: entry,
 								signal,
 								batchRequest: br,
 								allowFuzzy: tool.#allowFuzzy,
 								fuzzyThreshold: tool.#fuzzyThreshold,
 								writethrough: tool.#writethrough,
-								beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
+								beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
 							}),
 					);
-					return executeSinglePathEntries(path, runs, batchRequest, onUpdate, tool.session.cwd, signal);
+					return executeSinglePathEntries(targetPath, runs, batchRequest, onUpdate, tool.session.cwd, signal);
 				},
 			},
 		}[this.mode];
-	}
-
-	#beginDeferredDiagnosticsForPath(path: string): WritethroughDeferredHandle {
-		const existingDeferred = this.#pendingDeferredFetches.get(path);
-		if (existingDeferred) {
-			existingDeferred.abort();
-			this.#pendingDeferredFetches.delete(path);
-		}
-
-		const deferredController = new AbortController();
-		const editVersion = this.#bumpFileVersion(path);
-		return {
-			onDeferredDiagnostics: (lateDiagnostics: FileDiagnosticsResult) => {
-				this.#pendingDeferredFetches.delete(path);
-				this.#injectLateDiagnostics(path, lateDiagnostics, editVersion);
-			},
-			signal: deferredController.signal,
-			finalize: (diagnostics: FileDiagnosticsResult | undefined) => {
-				if (!diagnostics) {
-					this.#pendingDeferredFetches.set(path, deferredController);
-				} else {
-					deferredController.abort();
-				}
-			},
-		};
-	}
-
-	#injectLateDiagnostics(path: string, diagnostics: FileDiagnosticsResult, editVersion: number): void {
-		const effective = this.#dedupDiagnostics
-			? getDiagnosticsLedger(this.session).reduce(path, diagnostics)
-			: diagnostics;
-		if (this.#dedupDiagnostics && effective.messages.length === 0) return;
-
-		const entry: DeferredDiagnosticsEntry = {
-			path,
-			summary: effective.summary ?? "",
-			messages: effective.messages ?? [],
-			errored: effective.errored,
-			// Drop at flush time if a later edit to the same file superseded this fetch.
-			isStale: () => this.#fileVersion(path) !== editVersion,
-		};
-		this.session.queueDeferredDiagnostics?.(entry);
-	}
-
-	/** Bump the file's mutation counter (session-global when available). */
-	#bumpFileVersion(path: string): number {
-		if (this.session.bumpFileMutationVersion) return this.session.bumpFileMutationVersion(path);
-		const next = (this.#editVersionByPath.get(path) ?? 0) + 1;
-		this.#editVersionByPath.set(path, next);
-		return next;
-	}
-
-	/** Read the file's current mutation counter (session-global when available). */
-	#fileVersion(path: string): number {
-		if (this.session.getFileMutationVersion) return this.session.getFileMutationVersion(path);
-		return this.#editVersionByPath.get(path) ?? 0;
 	}
 }

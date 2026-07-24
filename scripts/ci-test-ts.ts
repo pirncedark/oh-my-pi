@@ -64,9 +64,17 @@ const validModes: Record<Mode, true> = {
 // under the CI runner's OOM ceiling (a single 170–370-file invocation gets
 // SIGKILLed at 137). The singleton/global-state bucket is left whole: its suites
 // co-locate in one process to exercise process-wide state, so they must not split.
+//
+// The UI/TUI bucket uses a smaller chunk (5) than the others: its suites build up
+// native ghostty-vt cells, and bun 1.3.14's GC aborts (SIGTRAP/SIGABRT, exit
+// 133/134 inside DOMGCOutputConstraint marking) once ~10 such files share a heap,
+// even with the GC-marker knobs below. Bisection showed no single file is at
+// fault — the crash is cumulative heap volume. Under a 256MB-forced heap, a
+// 10-file chunk aborts ~50% of runs while either 5-file half is 0/20; halving the
+// chunk keeps each process under the threshold.
 const codingAgentBucketPlans: Record<CodingAgentBucket, { label: string; parallel: number; chunkSize?: number }> = {
 	singleton: { label: "singleton/global-state bucket", parallel: 1 },
-	ui: { label: "UI/TUI bucket", parallel: 1, chunkSize: 10 },
+	ui: { label: "UI/TUI bucket", parallel: 1, chunkSize: 5 },
 	runtime: { label: "runtime/session bucket", parallel: 1, chunkSize: 10 },
 	native: { label: "native/tooling/browser/unit bucket", parallel: 1, chunkSize: 10 },
 };
@@ -111,7 +119,9 @@ const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
 // silently ignores unmatched filters when at least one other filter matches.)
 const repoScriptTests = [
 	"scripts/ci-concurrency.test.ts",
+	"scripts/ci-build-native.test.ts",
 	"scripts/ci-release-notes.test.ts",
+	"scripts/ci-release-publish.test.ts",
 	"scripts/fix-dts-extensions.test.ts",
 	"scripts/link-omp.test.ts",
 ];
@@ -345,6 +355,8 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 						"--parallel=4",
 						...onlyFailuresArgs,
 						"scripts/ci-concurrency.test.ts",
+						"scripts/ci-build-native.test.ts",
+						"scripts/ci-release-publish.test.ts",
 						"scripts/fix-dts-extensions.test.ts",
 					],
 				},
@@ -437,16 +449,25 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 	}
 
 	const env = buildChildEnv();
-	const proc = Bun.spawn(testCommand.command, {
-		cwd,
-		env,
-		stdout: "inherit",
-		stderr: "inherit",
-	});
-	const killTimer = setTimeout(() => proc.kill("SIGKILL"), chunkTimeoutMs());
-	const exitCode = await proc.exited;
-	clearTimeout(killTimer);
-	if (exitCode !== 0) {
+	for (let attempt = 1; ; attempt++) {
+		const proc = Bun.spawn(testCommand.command, {
+			cwd,
+			env,
+			stdout: "inherit",
+			stderr: "inherit",
+		});
+		const killTimer = setTimeout(() => proc.kill("SIGKILL"), chunkTimeoutMs());
+		const exitCode = await proc.exited;
+		clearTimeout(killTimer);
+		if (exitCode === 0) {
+			return;
+		}
+		if (BUN_CRASH_EXITS[exitCode] && attempt < MAX_CHUNK_ATTEMPTS) {
+			console.log(
+				`==> ${testCommand.label}: bun crashed (exit ${exitCode}); retrying (attempt ${attempt + 1}/${MAX_CHUNK_ATTEMPTS})`,
+			);
+			continue;
+		}
 		throw new Error(`${testCommand.label} failed with exit code ${exitCode}: ${renderedCommand}`);
 	}
 }
@@ -466,6 +487,13 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 //   bucket chunk crashed ~25% of runs with `BUN_JSC_forceRAMSize=256MB`,
 //   0/10 with markers=1, at zero measured wall-time cost. useConcurrentGC=0
 //   alone did not prevent it — the crash predates this knob.
+//
+// The knobs are necessary but not sufficient: the same GC bug also fires on
+// the *mutator* thread (`Heap::collectInMutatorThread` →
+// `MarkingConstraintSolver::runExecutionThread` → `DOMGCOutputConstraint` →
+// `JSAbortSignal::visitAdditionalChildrenInGCThread` reading a dead `reason`
+// cell), where no marker/concurrency knob applies. That residual crash is
+// handled by retrying crashed chunks in a fresh process (MAX_CHUNK_ATTEMPTS).
 function buildChildEnv(): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
 		...Bun.env,
@@ -492,6 +520,28 @@ function chunkTimeoutMs(): number {
 	if (Number.isFinite(raw) && raw >= 1) return raw * 1000;
 	return 600_000;
 }
+
+// Exit codes that mean the bun process itself died to a runtime fault
+// (128 + fatal signal) rather than reporting failing tests (which exit 1).
+// Bun's panic handler exits via SIGTRAP (133) on macOS; raw SIGILL/SIGBUS/
+// SIGABRT/SIGFPE/SIGSEGV surface as 132/135|138/134/136/139. 137 (SIGKILL)
+// is deliberately excluded: that's the watchdog or the OOM killer, and
+// retrying an OOM-killed chunk just OOMs again.
+const BUN_CRASH_EXITS: Record<number, true> = {
+	132: true,
+	133: true,
+	134: true,
+	135: true,
+	136: true,
+	138: true,
+	139: true,
+};
+
+// Total attempts a chunk gets when bun itself crashes. Bun 1.3.14's residual
+// GC crash (JSAbortSignal `reason` visited on a dead cell during marking) is
+// heap-timing dependent — a fresh process nearly always passes — while a
+// deterministic crash still fails every attempt and is reported normally.
+const MAX_CHUNK_ATTEMPTS = 3;
 
 // The standard `CI` signal is authoritative. In CI each bucket is its own
 // memory-capped runner job (a single fat invocation gets OOM-killed at 137), so
@@ -533,12 +583,14 @@ const style = {
 
 // Outcome of one finished chunk. `output` is the chunk's combined stdout+stderr,
 // buffered so it can be withheld during a quiet run and replayed only on failure.
+// `retries` counts extra attempts spent on bun-crash exits (see BUN_CRASH_EXITS).
 interface ChunkOutcome {
 	label: string;
 	command: string;
 	exitCode: number;
 	seconds: number;
 	output: string;
+	retries: number;
 }
 
 // Human duration in bun's bracket style: `[264ms]` under a second, `[3.3s]`
@@ -555,14 +607,15 @@ function formatDuration(seconds: number): string {
 // order as each chunk finishes.
 export function formatProgressLine(outcome: ChunkOutcome): string {
 	const time = style.dim(`[${formatDuration(outcome.seconds)}]`);
+	const retryNote = outcome.retries > 0 ? ` ${style.dim(`(retried ×${outcome.retries} after bun crash)`)}` : "";
 	if (outcome.exitCode === 0) {
-		return `${style.green("✓")} ${outcome.label} ${time}`;
+		return `${style.green("✓")} ${outcome.label} ${time}${retryNote}`;
 	}
 	const failing = extractFailingTests(outcome.output);
 	const first = failing[0]?.name;
 	const more = failing.length > 1 ? style.dim(` (+${failing.length - 1} more)`) : "";
 	const detail = first ? ` ${style.dim("—")} ${style.red(first)}${more}` : "";
-	return `${style.bold(style.red(`✗ ${outcome.label}`))} ${time}${detail}`;
+	return `${style.bold(style.red(`✗ ${outcome.label}`))} ${time}${detail}${retryNote}`;
 }
 
 // Closing tally in `bun test` style, but counting test *chunks* (child commands),
@@ -727,6 +780,44 @@ export async function runTestCommandsInParallel(commands: TestCommand[], concurr
 		return settled;
 	}
 
+	// One spawn of a chunk: pipes drained into buffers, watchdog-killed if it
+	// wedges, post-exit drain capped so leaked grandchildren holding the pipes
+	// can't keep the runner's event loop alive.
+	async function runAttempt(
+		testCommand: TestCommand,
+	): Promise<{ exitCode: number; output: string; timedOut: boolean }> {
+		const proc = Bun.spawn(testCommand.command, {
+			cwd: path.join(repoRoot, testCommand.cwd),
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdout = { text: "" };
+		const stderr = { text: "" };
+		const stdoutDrain = drainInto(proc.stdout as ReadableStream<Uint8Array>, stdout);
+		const stderrDrain = drainInto(proc.stderr as ReadableStream<Uint8Array>, stderr);
+		const drains = Promise.all([stdoutDrain.done, stderrDrain.done]);
+		// Watchdog: a wedged child (e.g. bun's panic handler deadlocking
+		// after a GC crash) would otherwise hang this worker forever.
+		let timedOut = false;
+		const killTimer = setTimeout(() => {
+			timedOut = true;
+			proc.kill("SIGKILL");
+		}, chunkTimeoutMs());
+		const exitCode = await proc.exited;
+		clearTimeout(killTimer);
+		if (!(await settleWithin(drains, 5000))) {
+			stdoutDrain.cancel();
+			stderrDrain.cancel();
+			await drains;
+		}
+		return {
+			exitCode,
+			timedOut,
+			output: `${stdout.text}${stderr.text}${timedOut ? `\n[watchdog] chunk exceeded ${Math.round(chunkTimeoutMs() / 1000)}s; killed with SIGKILL (OMP_TEST_CHUNK_TIMEOUT to change)\n` : ""}`,
+		};
+	}
+
 	async function worker(): Promise<void> {
 		for (;;) {
 			const testCommand = queue.shift();
@@ -735,55 +826,39 @@ export async function runTestCommandsInParallel(commands: TestCommand[], concurr
 			}
 			const renderedCommand = testCommand.command.map(shellQuote).join(" ");
 			const startedAt = performance.now();
-			const proc = Bun.spawn(testCommand.command, {
-				cwd: path.join(repoRoot, testCommand.cwd),
-				env,
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			const stdout = { text: "" };
-			const stderr = { text: "" };
-			const stdoutDrain = drainInto(proc.stdout as ReadableStream<Uint8Array>, stdout);
-			const stderrDrain = drainInto(proc.stderr as ReadableStream<Uint8Array>, stderr);
-			const drains = Promise.all([stdoutDrain.done, stderrDrain.done]);
-			// Watchdog: a wedged child (e.g. bun's panic handler deadlocking
-			// after a GC crash) would otherwise hang this worker forever.
-			let timedOut = false;
-			const killTimer = setTimeout(() => {
-				timedOut = true;
-				proc.kill("SIGKILL");
-			}, chunkTimeoutMs());
-			const exitCode = await proc.exited;
-			clearTimeout(killTimer);
-			// Cap the post-exit drain: a leaked grandchild that inherited the
-			// pipes keeps them open indefinitely, and a pending read would keep
-			// the runner's event loop alive — cancel the readers instead.
-			if (!(await settleWithin(drains, 5000))) {
-				stdoutDrain.cancel();
-				stderrDrain.cancel();
-				await drains;
+			let attempt = 1;
+			let result = await runAttempt(testCommand);
+			// Bun-crash retry: a 128+signal exit means the runtime died (GC
+			// segfault/abort), not that tests failed — rerun in a fresh heap.
+			while (!result.timedOut && BUN_CRASH_EXITS[result.exitCode] && attempt < MAX_CHUNK_ATTEMPTS) {
+				attempt += 1;
+				process.stdout.write(
+					`${style.dim(`↻ ${testCommand.label} — bun crashed (exit ${result.exitCode}); retrying (attempt ${attempt}/${MAX_CHUNK_ATTEMPTS})`)}\n`,
+				);
+				result = await runAttempt(testCommand);
 			}
 			completed += 1;
 			const outcome: ChunkOutcome = {
 				label: testCommand.label,
 				command: renderedCommand,
-				exitCode,
+				exitCode: result.exitCode,
 				seconds: (performance.now() - startedAt) / 1000,
-				output: `${stdout.text}${stderr.text}${timedOut ? `\n[watchdog] chunk exceeded ${Math.round(chunkTimeoutMs() / 1000)}s; killed with SIGKILL (OMP_TEST_CHUNK_TIMEOUT to change)\n` : ""}`,
+				output: result.output,
+				retries: attempt - 1,
 			};
 			if (quiet) {
 				let msg = `${formatProgressLine(outcome)}\n`;
-				if (exitCode !== 0 || timedOut) {
+				if (result.exitCode !== 0 || result.timedOut) {
 					msg += `${formatChunkFailure(outcome, true)}\n`;
 				}
 				process.stdout.write(msg);
 			} else {
-				const status = exitCode === 0 ? "ok" : `FAILED exit ${exitCode}`;
+				const status = result.exitCode === 0 ? "ok" : `FAILED exit ${result.exitCode}`;
 				process.stdout.write(
 					`\n==> [${completed}/${commands.length}] ${testCommand.label} (${status}, ${outcome.seconds.toFixed(1)}s)\n$ ${renderedCommand}\n${outcome.output}`,
 				);
 			}
-			if (exitCode !== 0 || timedOut) {
+			if (result.exitCode !== 0 || result.timedOut) {
 				failures.push(outcome);
 			}
 		}

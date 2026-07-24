@@ -16,6 +16,15 @@ import { AgentTranscriptViewer } from "@oh-my-pi/pi-coding-agent/modes/component
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import {
+	getKittyGraphics,
+	ImageBudget,
+	ImageProtocol,
+	setKittyGraphics,
+	setTerminalImageProtocol,
+	TERMINAL,
+	type TUI,
+} from "@oh-my-pi/pi-tui";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 const TS = new Date().toISOString();
@@ -38,7 +47,7 @@ function buildJsonl(): string {
 			id: "u0",
 			parentId: null,
 			timestamp: TS,
-			message: { role: "user", synthetic: true, attribution: "agent", content: "PROMPTMARKER", timestamp: 0 },
+			message: { role: "user", synthetic: true, attribution: "agent", content: "### PROMPTMARKER", timestamp: 0 },
 		}),
 	);
 	for (let i = 0; i < 40; i++) {
@@ -64,17 +73,71 @@ function buildJsonl(): string {
 	return `${lines.join("\n")}\n`;
 }
 
+function buildImageJsonl(): string {
+	const usage = {
+		input: 1,
+		output: 1,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 2,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	const entries = [
+		JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "adv", timestamp: TS, cwd: "/tmp" }),
+		JSON.stringify({
+			type: "message",
+			id: "a0",
+			parentId: null,
+			timestamp: TS,
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "image-call", name: "eval", arguments: { language: "py", code: "display" } },
+				],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "gpt-5.5",
+				usage,
+				stopReason: "toolUse",
+				timestamp: 1,
+			},
+		}),
+		JSON.stringify({
+			type: "message",
+			id: "t0",
+			parentId: "a0",
+			timestamp: TS,
+			message: {
+				role: "toolResult",
+				toolCallId: "image-call",
+				toolName: "eval",
+				content: [
+					{ type: "text", text: "displayed image" },
+					{
+						type: "image",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+						mimeType: "image/png",
+					},
+				],
+				isError: false,
+				timestamp: 2,
+			},
+		}),
+	];
+	return `${entries.join("\n")}\n`;
+}
+
 function messageLine(id: string, content: string): string {
 	return JSON.stringify({
 		type: "message",
 		id,
 		parentId: null,
 		timestamp: TS,
-		message: { role: "user", synthetic: true, attribution: "agent", content, timestamp: 0 },
+		message: { role: "user", synthetic: true, attribution: "agent", content: `### ${content}`, timestamp: 0 },
 	});
 }
 
-function makeViewer(file: string, remote?: AgentHubRemote) {
+function makeViewer(file: string, remote?: AgentHubRemote, ui?: TUI) {
 	const agents = new AgentRegistry();
 	agents.register({
 		id: "Main/advisor",
@@ -88,7 +151,7 @@ function makeViewer(file: string, remote?: AgentHubRemote) {
 	return new AgentTranscriptViewer({
 		agentId: "Main/advisor",
 		registry: agents,
-		ui: { requestRender: () => {}, requestComponentRender: () => {} } as never,
+		ui: ui ?? ({ requestRender: () => {}, requestComponentRender: () => {} } as never),
 		cwd: "/tmp",
 		remote,
 		expandKeys: ["ctrl+o"],
@@ -149,6 +212,74 @@ describe("AgentTranscriptViewer", () => {
 		});
 	});
 
+	it("collapses synthetic advisor inputs on cold open and expands their body on ctrl+o", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-collapse-"));
+		const file = path.join(dir, "__advisor.jsonl");
+		// A synthetic `Session update` whose body carries a distinctive marker
+		// far larger than the viewport. Cold open must NOT lay it out; the reader
+		// only sees a compact summary until ctrl+o.
+		const bodyLines = ["### Session update", ""];
+		for (let i = 0; i < 500; i++) bodyLines.push(`- SYNTHBODYMARKER line ${i}`);
+		const body = bodyLines.join("\n");
+		const jsonl = [
+			JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "adv", timestamp: TS, cwd: "/tmp" }),
+			JSON.stringify({
+				type: "message",
+				id: "u0",
+				parentId: null,
+				timestamp: TS,
+				message: { role: "user", synthetic: true, attribution: "agent", content: body, timestamp: 0 },
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "a0",
+				parentId: null,
+				timestamp: TS,
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Advice." }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "gpt-5.5",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 0,
+				},
+			}),
+		].join("\n");
+		fs.writeFileSync(file, `${jsonl}\n`);
+		const viewer = makeViewer(file);
+		try {
+			viewer.render(80);
+			viewer.handleInput("g"); // scroll to top
+			const collapsed = viewer.render(80).map(l => Bun.stripANSI(l));
+			const collapsedBody = collapsed.join("\n");
+			// The synthetic body is not laid out; only the summary row shows.
+			expect(collapsedBody).not.toContain("SYNTHBODYMARKER");
+			expect(collapsed.some(l => /Session update .* line/.test(l))).toBe(true);
+
+			// ctrl+o reveals the full body; scroll back to the top to see it.
+			viewer.handleInput("\x0f");
+			viewer.render(80);
+			viewer.handleInput("g");
+			const expandedBody = viewer
+				.render(80)
+				.map(l => Bun.stripANSI(l))
+				.join("\n");
+			expect(expandedBody).toContain("SYNTHBODYMARKER");
+		} finally {
+			viewer.dispose();
+			removeSyncWithRetries(dir);
+		}
+	});
+
 	it("scrolls the visible window with j/k and g/G", () => {
 		withViewer(viewer => {
 			const atBottom = viewer
@@ -164,6 +295,37 @@ describe("AgentTranscriptViewer", () => {
 			expect(atTop).toContain("PROMPTMARKER");
 			expect(atBottom).not.toContain("PROMPTMARKER");
 		});
+	});
+
+	it("renders tool-result images through the shared Kitty placeholder budget", async () => {
+		await Settings.init({ inMemory: true, overrides: { "terminal.showImages": true } });
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-image-"));
+		const file = path.join(dir, "__advisor.jsonl");
+		fs.writeFileSync(file, buildImageJsonl());
+		const previousProtocol = TERMINAL.imageProtocol;
+		const previousGraphics = getKittyGraphics();
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		setKittyGraphics({ unicodePlaceholders: true });
+		const imageBudget = new ImageBudget(8, () => {});
+		const ui = {
+			imageBudget,
+			requestRender: () => {},
+			requestComponentRender: () => {},
+		} as unknown as TUI;
+		const viewer = makeViewer(file, undefined, ui);
+		try {
+			imageBudget.beginPass();
+			const rendered = viewer.render(80).join("\n");
+			imageBudget.endPass();
+			expect(rendered).toContain("a=p,U=1");
+			expect(rendered).toContain("\u{10eeee}");
+			expect(imageBudget.takeTransmits().join("")).toContain("a=t");
+		} finally {
+			viewer.dispose();
+			setKittyGraphics(previousGraphics);
+			setTerminalImageProtocol(previousProtocol);
+			removeSyncWithRetries(dir);
+		}
 	});
 
 	it("clears stale content when the transcript file is deleted while open", async () => {

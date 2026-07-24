@@ -10,7 +10,7 @@ import type {
 	ToolApprovalDecision,
 } from "@oh-my-pi/pi-agent-core";
 
-import { getWorktreeDir, hashPath, isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { getWorktreeDir, hashPath, isEnoent, logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import type { Settings } from "../config/settings";
 import githubDescription from "../prompts/tools/github.md" with { type: "text" };
@@ -239,6 +239,8 @@ const RUN_WATCH_TAIL_DEFAULT = 15;
 const RUN_WATCH_TAIL_MAX = 200;
 const REVIEW_COMMENTS_PAGE_SIZE = 100;
 const RUN_JOBS_PAGE_SIZE = 100;
+const PR_DIFF_FILES_PAGE_SIZE = 100;
+const PR_DIFF_FILES_MAX = 3000;
 const PR_URL_PATTERN = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)(?:\/.*)?$/;
 const ISSUE_URL_PATTERN = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)(?:\/.*)?$/;
 const RUN_URL_PATTERN = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)(?:\/.*)?$/;
@@ -247,6 +249,7 @@ const RUN_FAILURE_CONCLUSIONS = new Set(["failure", "timed_out", "cancelled", "a
 const JOB_FAILURE_CONCLUSIONS = new Set(["failure", "timed_out", "cancelled", "action_required"]);
 const GITHUB_READONLY_OPS: ReadonlySet<string> = new Set([
 	"repo_view",
+	"file_read",
 	"search_issues",
 	"search_prs",
 	"search_code",
@@ -257,10 +260,11 @@ const GITHUB_READONLY_OPS: ReadonlySet<string> = new Set([
 
 const githubSchema = type({
 	op: type(
-		"'repo_view' | 'pr_create' | 'pr_checkout' | 'pr_push' | 'search_issues' | 'search_prs' | 'search_code' | 'search_commits' | 'search_repos' | 'run_watch'",
+		"'repo_view' | 'file_read' | 'pr_create' | 'pr_checkout' | 'pr_push' | 'search_issues' | 'search_prs' | 'search_code' | 'search_commits' | 'search_repos' | 'run_watch'",
 	).describe("github operation"),
 	"repo?": type("string").describe("owner/repo"),
 	"branch?": type("string").describe("branch"),
+	"path?": type("string").describe("repository-relative file path"),
 	"pr?": type("string | string[]").describe("pr number, url, or branch"),
 	"force?": type("boolean").describe("reset existing local branch"),
 	"forceWithLease?": type("boolean").describe("force-with-lease push"),
@@ -2453,7 +2457,7 @@ export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails>
 		const op = typeof rawOp === "string" ? rawOp : "";
 		return GITHUB_READONLY_OPS.has(op) ? "read" : "exec";
 	};
-	readonly summary = "Interact with GitHub issues, pull requests, and repositories";
+	readonly summary = "Interact with GitHub repositories, files, pull requests, and Actions";
 	readonly loadMode = "discoverable";
 	readonly label = "GitHub";
 	readonly description = prompt.render(githubDescription);
@@ -2478,6 +2482,8 @@ export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails>
 			switch (params.op) {
 				case "repo_view":
 					return executeRepoView(this.session, params, signal);
+				case "file_read":
+					return executeFileRead(this.session, params, signal);
 				case "pr_create":
 					return executePrCreate(this.session, params, signal);
 				case "pr_checkout":
@@ -2521,6 +2527,40 @@ async function executeRepoView(
 		repoProvided: Boolean(repo),
 	});
 	return buildTextResult(formatRepoView(data, { repo, branch }), data.url);
+}
+
+async function executeFileRead(
+	session: ToolSession,
+	params: GithubInput,
+	signal: AbortSignal | undefined,
+): Promise<AgentToolResult<GhToolDetails>> {
+	const repo = await resolveGitHubRepo(session.cwd, normalizeOptionalString(params.repo), undefined, signal);
+	const filePath = requireNonEmpty(normalizeOptionalString(params.path), "path");
+	if (filePath.startsWith("/")) {
+		throw new ToolError("path must be repository-relative");
+	}
+	const branch = normalizeOptionalString(params.branch);
+	const endpointPath = filePath
+		.split("/")
+		.map(segment => encodeURIComponent(segment))
+		.join("/");
+	const args = [
+		"api",
+		`/repos/${repo}/contents/${endpointPath}`,
+		"--method",
+		"GET",
+		"-H",
+		"Accept: application/vnd.github.raw+json",
+	];
+	if (branch) {
+		args.push("-f", `ref=${branch}`);
+	}
+	const text = await git.github.text(session.cwd, args, signal, {
+		repoProvided: true,
+		trimOutput: false,
+	});
+	const sourceUrl = `https://github.com/${repo}/blob/${encodeURIComponent(branch ?? "HEAD")}/${endpointPath}`;
+	return buildTextResult(text, sourceUrl, { repo, branch });
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2931,6 +2971,160 @@ function parsePrDiffSection(section: string, startOffset: number, endOffset: num
 	return file;
 }
 
+/**
+ * A single entry from `GET /repos/{owner}/{repo}/pulls/{n}/files`. `patch` is
+ * absent for binary files and for individual file diffs GitHub deems too large
+ * to render.
+ */
+interface GhPrFileApi {
+	filename?: string;
+	previous_filename?: string;
+	status?: string;
+	additions?: number;
+	deletions?: number;
+	patch?: string;
+}
+
+interface GhPrApi {
+	changed_files?: number;
+}
+
+/**
+ * GitHub rejects the aggregate PR diff endpoint with HTTP 406 once the diff
+ * exceeds 20,000 lines. Detect that specific failure so the caller can fall
+ * back to the per-file endpoint instead of aborting the whole review.
+ */
+function isPrDiffTooLargeError(err: unknown): boolean {
+	const message = err instanceof Error ? err.message : String(err);
+	return (
+		/\bHTTP 406\b/.test(message) ||
+		/exceeded the maximum number of lines/i.test(message) ||
+		/\btoo_large\b/.test(message)
+	);
+}
+
+function formatSyntheticDiffPath(prefix: "a/" | "b/", path: string): string {
+	const prefixedPath = `${prefix}${path}`;
+	if (!/[\u0000-\u001F\s"\\]/.test(prefixedPath)) return prefixedPath;
+
+	let escaped = "";
+	for (const char of prefixedPath) {
+		switch (char) {
+			case "\\":
+				escaped += "\\\\";
+				break;
+			case '"':
+				escaped += '\\"';
+				break;
+			case "\n":
+				escaped += "\\n";
+				break;
+			case "\r":
+				escaped += "\\r";
+				break;
+			case "\t":
+				escaped += "\\t";
+				break;
+			default: {
+				const code = char.charCodeAt(0);
+				escaped += code < 32 ? `\\${code.toString(8).padStart(3, "0")}` : char;
+			}
+		}
+	}
+	return `"${escaped}"`;
+}
+
+/**
+ * Reconstruct a `diff --git` section from a single files-API entry. The API's
+ * `patch` field carries only the hunk body, so the `diff --git`/`---`/`+++`
+ * headers are synthesized to match `gh pr diff` output — this keeps
+ * {@link parsePrUnifiedDiff} and the review parser producing identical section
+ * boundaries and byte offsets. Files whose `patch` is omitted (binary or
+ * too-large) stay visible with an explicit marker rather than being dropped.
+ */
+function buildSyntheticDiffSection(file: GhPrFileApi): string | undefined {
+	const newPath = file.filename;
+	if (!newPath) return undefined;
+	const status = file.status ?? "modified";
+	const oldPath = file.previous_filename ?? newPath;
+	const oldDiffPath = formatSyntheticDiffPath("a/", oldPath);
+	const newDiffPath = formatSyntheticDiffPath("b/", newPath);
+	const lines: string[] = [`diff --git ${oldDiffPath} ${newDiffPath}`];
+	if (status === "added") {
+		lines.push("new file mode 100644");
+	} else if (status === "removed") {
+		lines.push("deleted file mode 100644");
+	} else if (status === "renamed" || file.previous_filename) {
+		lines.push(`rename from ${oldPath}`, `rename to ${newPath}`);
+	}
+	if (typeof file.patch === "string" && file.patch.length > 0) {
+		lines.push(status === "added" ? "--- /dev/null" : `--- ${oldDiffPath}`);
+		lines.push(status === "removed" ? "+++ /dev/null" : `+++ ${newDiffPath}`);
+		lines.push(file.patch);
+	} else {
+		lines.push(
+			`* patch unavailable (binary or too large); additions ${file.additions ?? 0}, deletions ${file.deletions ?? 0}`,
+		);
+	}
+	return lines.join("\n");
+}
+
+/**
+ * Fallback PR diff retrieval via the paginated per-file endpoint, used when the
+ * aggregate `gh pr diff` is rejected for exceeding GitHub's 20,000-line limit.
+ * The per-file patches are not subject to that aggregate cap, so even very
+ * large PRs can be reassembled into a synthetic unified diff.
+ */
+async function fetchPrDiffViaFilesApi(
+	cwd: string,
+	repo: string,
+	number: number,
+	signal: AbortSignal | undefined,
+): Promise<string> {
+	const pull = await git.github.json<GhPrApi>(
+		cwd,
+		["api", "--method", "GET", `/repos/${repo}/pulls/${number}`],
+		signal,
+		{ repoProvided: true },
+	);
+	if ((pull.changed_files ?? 0) > PR_DIFF_FILES_MAX) {
+		throw new ToolError(
+			`Pull request changes ${pull.changed_files} files, exceeding GitHub's ${PR_DIFF_FILES_MAX}-file limit for the per-file diff API.`,
+		);
+	}
+
+	const sections: string[] = [];
+	let page = 1;
+	while (true) {
+		const response = await git.github.json<GhPrFileApi[]>(
+			cwd,
+			[
+				"api",
+				"--method",
+				"GET",
+				`/repos/${repo}/pulls/${number}/files`,
+				"-F",
+				`per_page=${PR_DIFF_FILES_PAGE_SIZE}`,
+				"-F",
+				`page=${page}`,
+			],
+			signal,
+			{ repoProvided: true },
+		);
+		for (const file of response) {
+			const section = buildSyntheticDiffSection(file);
+			if (section) sections.push(section);
+		}
+		if (response.length < PR_DIFF_FILES_PAGE_SIZE) {
+			break;
+		}
+		page += 1;
+	}
+	// Trailing newline mirrors `gh pr diff` so downstream parsers splitting on
+	// `^diff --git ` see identical boundaries.
+	return sections.length > 0 ? `${sections.join("\n")}\n` : "";
+}
+
 async function fetchPrDiffFresh(
 	cwd: string,
 	repo: string,
@@ -2939,7 +3133,18 @@ async function fetchPrDiffFresh(
 ): Promise<{ rendered: string; sourceUrl: string | undefined; payload: PrDiffPayload }> {
 	const args = ["pr", "diff", String(number), "--color", "never"];
 	appendRepoFlag(args, repo, String(number));
-	const text = await git.github.text(cwd, args, signal, { repoProvided: true, trimOutput: false });
+	let text: string;
+	try {
+		text = await git.github.text(cwd, args, signal, { repoProvided: true, trimOutput: false });
+	} catch (err) {
+		if (!isPrDiffTooLargeError(err)) throw err;
+		logger.debug("gh pr diff exceeded GitHub's aggregate line limit; falling back to per-file API", {
+			repo,
+			number,
+			err: String(err),
+		});
+		text = await fetchPrDiffViaFilesApi(cwd, repo, number, signal);
+	}
 	const payload = parsePrUnifiedDiff(text);
 	// `rendered` already carries the verbatim diff; blank the payload copy so
 	// the cache row stores a potentially huge diff once instead of twice.
@@ -3419,7 +3624,9 @@ async function executeSearchCode(
 	signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<GhToolDetails>> {
 	const query = requireNonEmpty(params.query, "query");
-	if (params.since !== undefined || params.until !== undefined) {
+	const since = normalizeOptionalString(params.since);
+	const until = normalizeOptionalString(params.until);
+	if (since !== undefined || until !== undefined) {
 		throw new ToolError("search_code does not support since/until; GitHub code search has no date qualifier.");
 	}
 	const limit = resolveSearchLimit(params.limit);
